@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import queue
 import re
 import shlex
 import subprocess
+import threading
 import tempfile
 import time
 from pathlib import Path
@@ -13,6 +16,18 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+
+
+class RFDETRExpectedBackboneWarningFilter(logging.Filter):
+    """Hide two expected backbone-layout notices from RF-DETR startup."""
+
+    prefixes = (
+        "Using a different number of positional encodings than DINOv2",
+        "Using patch size ",
+    )
+
+    def filter(self, record):
+        return not str(record.getMessage()).startswith(self.prefixes)
 
 
 class Adapter:
@@ -26,6 +41,11 @@ class Adapter:
 
     def predict(self, frame, conf, prompt=""):
         raise NotImplementedError
+
+    def temp_dir(self):
+        directory = self.ctx["ROOT"] / "cache" / "tmp"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
 
 
 class YOLOAdapter(Adapter):
@@ -71,12 +91,36 @@ class RFDETRAdapter(Adapter):
     def prepare(self, progress):
         from rfdetr import RFDETRLarge
         from rfdetr.assets.coco_classes import COCO_CLASSES
+
+        # RF-DETR's published Large/XL checkpoints intentionally use a
+        # non-DINOv2 patch layout. These two messages are expected after the
+        # full RF-DETR checkpoint is loaded, not a degraded-load condition.
+        rfdetr_log = logging.getLogger("rf-detr")
+        if not any(
+            isinstance(item, RFDETRExpectedBackboneWarningFilter)
+            for item in rfdetr_log.filters
+        ):
+            rfdetr_log.addFilter(RFDETRExpectedBackboneWarningFilter())
+
         progress.note(f"Loading {self.c['name']}")
         if self.c["variant"] == "large":
-            self.model = RFDETRLarge()
+            self.model = RFDETRLarge(num_classes=90)
         else:
             from rfdetr_plus import RFDETRXLarge
-            self.model = RFDETRXLarge(accept_platform_model_license=True)
+
+            self.model = RFDETRXLarge(
+                accept_platform_model_license=True,
+                num_classes=90,
+            )
+
+        # RF-DETR emits a latency warning until inference() configures the
+        # deployment model. Keep a single model in memory and use FP16 only
+        # when CUDA is available.
+        self.model.inference(
+            compile=False,
+            dtype=torch.float16 if self.ctx["DEVICE"] == "cuda" else torch.float32,
+            inplace=True,
+        )
         self.labels = COCO_CLASSES
 
     def predict(self, frame, conf, prompt=""):
@@ -128,7 +172,7 @@ class GroundingDinoAdapter(Adapter):
         raw = self.processor.post_process_grounded_object_detection(
             outputs,
             input_ids=inputs.get("input_ids"),
-            box_threshold=conf,
+            threshold=conf,
             text_threshold=0.25,
             target_sizes=torch.tensor([image.size[::-1]], device=self.ctx["DEVICE"]),
         )[0]
@@ -145,26 +189,51 @@ def _classes(prompt):
 
 
 class YOLOWorldAdapter(Adapter):
+    def model_directory(self):
+        directory = self.ctx["ROOT"] / "cache" / "models"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
     def prepare(self, progress):
         from ultralytics import YOLOWorld
-        self.model = YOLOWorld(self.c["weight"]).to(self.ctx["DEVICE"])
+        self.model = self.load_ultralytics_model(YOLOWorld).to(self.ctx["DEVICE"])
         self._classes = None
+
+    def load_ultralytics_model(self, model_class):
+        """Download prompted YOLO weights only into testmodel/cache/models."""
+        weight = Path(self.c["weight"])
+        if not weight.is_absolute():
+            weight = self.model_directory() / weight.name
+        weight.parent.mkdir(parents=True, exist_ok=True)
+        previous = Path.cwd()
+        try:
+            os.chdir(weight.parent)
+            return model_class(weight.name)
+        finally:
+            os.chdir(previous)
 
     def predict(self, frame, conf, prompt=""):
         if not prompt.strip():
             raise ValueError("YOLO-World requires a text prompt")
         started = time.perf_counter()
         classes = _classes(prompt)
-        if classes != self._classes:
-            self.model.set_classes(classes)
-            self._classes = classes
-        pred = self.model.predict(
-            frame,
-            conf=conf,
-            imgsz=640,
-            device=0 if self.ctx["DEVICE"] == "cuda" else "cpu",
-            verbose=False,
-        )[0]
+        previous = Path.cwd()
+        try:
+            # YOLOE lazily fetches MobileCLIP during its first prediction.
+            # Keep that secondary asset with the main checkpoint.
+            os.chdir(self.model_directory())
+            if classes != self._classes:
+                self.model.set_classes(classes)
+                self._classes = classes
+            pred = self.model.predict(
+                frame,
+                conf=conf,
+                imgsz=640,
+                device=0 if self.ctx["DEVICE"] == "cuda" else "cpu",
+                verbose=False,
+            )[0]
+        finally:
+            os.chdir(previous)
         dets = []
         if pred.boxes is not None:
             for box in pred.boxes:
@@ -177,7 +246,7 @@ class YOLOWorldAdapter(Adapter):
 class YOLOEAdapter(YOLOWorldAdapter):
     def prepare(self, progress):
         from ultralytics import YOLOE
-        self.model = YOLOE(self.c["weight"]).to(self.ctx["DEVICE"])
+        self.model = self.load_ultralytics_model(YOLOE).to(self.ctx["DEVICE"])
         self._classes = None
 
 
@@ -199,7 +268,11 @@ class GroundingDino15EdgeAdapter(Adapter):
         started = time.perf_counter()
         path = None
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".png",
+                dir=self.temp_dir(),
+            ) as f:
                 path = Path(f.name)
             cv2.imwrite(str(path), frame)
             task = self.V2Task(
@@ -232,6 +305,45 @@ class GroundingDino15EdgeAdapter(Adapter):
 
 
 class LocateAnythingAdapter(Adapter):
+    def _acquire_worker_lock(self, lock_path):
+        """Allow only one LocateAnything worker across notebook kernels."""
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                descriptor = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+            except FileExistsError:
+                try:
+                    owner_pid = int(lock_path.read_text(encoding="utf-8").strip())
+                    if owner_pid < 1:
+                        raise ValueError("invalid PID")
+                    os.kill(owner_pid, 0)
+                except (OSError, ValueError):
+                    # The previous kernel stopped without releasing its lock.
+                    lock_path.unlink(missing_ok=True)
+                    continue
+                raise RuntimeError(
+                    "LocateAnything is already loading or active in another notebook "
+                    "kernel. Stop it there before starting a second session."
+                )
+            else:
+                os.write(descriptor, str(os.getpid()).encode("ascii"))
+                self._worker_lock_descriptor = descriptor
+                self._worker_lock_path = lock_path
+                return
+
+    def _release_worker_lock(self):
+        descriptor = getattr(self, "_worker_lock_descriptor", None)
+        if descriptor is not None:
+            os.close(descriptor)
+            self._worker_lock_descriptor = None
+        lock_path = getattr(self, "_worker_lock_path", None)
+        if lock_path is not None:
+            lock_path.unlink(missing_ok=True)
+            self._worker_lock_path = None
+
     def prepare(self, progress):
         root = self.ctx["ROOT"]
         default = root / ".venv-locateanything" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -244,16 +356,70 @@ class LocateAnythingAdapter(Adapter):
             "--model", self.c["model"],
             "--device", self.ctx["DEVICE"],
         ]
-        self.proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+        worker_root = root / "cache" / "locateanything"
+        worker_hf = worker_root / "huggingface"
+        worker_tmp = worker_root / "tmp"
+        worker_log = root / "logs" / "locateanything_worker.log"
+        for directory in (worker_hf, worker_tmp, worker_log.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+        self._acquire_worker_lock(worker_root / "worker.lock")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HF_HOME": str(worker_hf),
+                "HUGGINGFACE_HUB_CACHE": str(worker_hf / "hub"),
+                "TRANSFORMERS_CACHE": str(worker_hf / "hub"),
+                "XDG_CACHE_HOME": str(worker_root / "xdg"),
+                "TEMP": str(worker_tmp),
+                "TMP": str(worker_tmp),
+                "TMPDIR": str(worker_tmp),
+                "PYTHONUNBUFFERED": "1",
+            }
         )
-        if self.proc.stdout.readline().strip() != "READY":
-            raise RuntimeError("LocateAnything worker failed to start")
+        try:
+            self._log_handle = worker_log.open("a", encoding="utf-8")
+            self.proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._log_handle,
+                text=True,
+                bufsize=1,
+                cwd=root,
+                env=environment,
+            )
+        except Exception:
+            self.unload()
+            raise
+        timeout_s = float(self.ctx["env_value"]("LOCATEANYTHING_STARTUP_TIMEOUT_S", "180"))
+        ready_lines = queue.Queue(maxsize=1)
+        threading.Thread(
+            target=lambda: ready_lines.put(self.proc.stdout.readline()),
+            daemon=True,
+        ).start()
+        started_at = time.monotonic()
+        while True:
+            elapsed_s = time.monotonic() - started_at
+            remaining_s = timeout_s - elapsed_s
+            if remaining_s <= 0:
+                self.unload()
+                raise TimeoutError(
+                    f"LocateAnything did not become ready within {timeout_s:.0f}s; "
+                    "see logs/locateanything_worker.log"
+                )
+            try:
+                ready = ready_lines.get(timeout=min(1.0, remaining_s)).strip()
+                break
+            except queue.Empty:
+                progress.note(
+                    "Starting LocateAnything worker "
+                    f"({elapsed_s:.0f}s / {timeout_s:.0f}s timeout)"
+                )
+        if ready != "READY":
+            self.unload()
+            raise RuntimeError(
+                "LocateAnything worker failed to start; see logs/locateanything_worker.log"
+            )
 
     def predict(self, frame, conf, prompt=""):
         if not prompt.strip():
@@ -261,7 +427,11 @@ class LocateAnythingAdapter(Adapter):
         started = time.perf_counter()
         path = None
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".jpg",
+                dir=self.temp_dir(),
+            ) as f:
                 path = Path(f.name)
             cv2.imwrite(str(path), frame)
             request = {
@@ -298,7 +468,12 @@ class LocateAnythingAdapter(Adapter):
         if getattr(self, "proc", None):
             try:
                 self.proc.terminate()
+                self.proc.wait(timeout=10)
             except Exception:
                 pass
             self.proc = None
+        if getattr(self, "_log_handle", None):
+            self._log_handle.close()
+            self._log_handle = None
+        self._release_worker_lock()
         super().unload()
