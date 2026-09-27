@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rt-lcod"
+version = "0.1.0"
+description = "Real-time Language-Conditioned Object Detection research scaffold"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.3",
+  "torchvision>=0.18",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+runtime = [
+  "opencv-python>=4.10",
+  "ultralytics>=8.4.0",
+  "transformers>=5.1,<6",
+]
+teacher = ["transformers>=5.1,<6"]
+notebook = ["jupyter>=1.1", "ipywidgets>=8.1", "matplotlib>=3.9"]
+dev = ["pytest>=8.0", "ruff>=0.8", "nbformat>=5.10"]
+all = [
+  "opencv-python>=4.10",
+  "ultralytics>=8.4.0",
+  "transformers>=5.1,<6",
+  "jupyter>=1.1",
+  "ipywidgets>=8.1",
+  "matplotlib>=3.9",
+  "pytest>=8.0",
+  "ruff>=0.8",
+  "nbformat>=5.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
