@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 
 from torch.utils.data import DataLoader, Dataset
 import torch
@@ -15,6 +16,11 @@ from rt_lcod.utils.logging import RunLogger
 from rt_lcod.utils.seed import seed_everything
 
 
+def safe_name(value: str) -> str:
+    """Match the filename sanitization used by candidate/teacher cache builders."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
 class TeacherMergedDataset(Dataset):
     def __init__(self, base: Dataset, teacher_root: str | Path):
         self.base = base
@@ -25,7 +31,7 @@ class TeacherMergedDataset(Dataset):
 
     def __getitem__(self, index):
         item = dict(self.base[index])
-        path = self.teacher_root / f"{item['sample_id']}.pt"
+        path = self.teacher_root / f"{safe_name(str(item['sample_id']))}.pt"
         if not path.exists():
             raise FileNotFoundError(f"missing teacher cache: {path}")
         teacher = torch.load(path, map_location="cpu", weights_only=False)
