@@ -1,0 +1,10 @@
+# Local models, package caches, and downloaded media are intentionally local.
+cache/
+data/
+logs/
+outputs/live_sessions/
+
+# Python and Jupyter transient files.
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
