@@ -1,0 +1,53 @@
+seed: 7
+run_name: smoke
+
+device: cpu
+amp: false
+
+model:
+  visual_dim: 32
+  text_dim: 24
+  hidden_dim: 48
+  region_encoder: tiny
+  dropout: 0.0
+  top_k: 8
+  relation_feature_dim: 11
+  detector_name: none
+  text_model_name: none
+
+training:
+  epochs: 2
+  batch_size: 2
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  num_workers: 0
+  save_every_epochs: 1
+  early_stopping_patience: 4
+  kd_temperature: 2.0
+
+loss:
+  target: 1.0
+  attribute: 0.2
+  relation: 0.2
+  no_target: 0.2
+  distillation: 0.2
+
+validation:
+  primary_metric: composite
+  composite:
+    grounding_acc_iou50: 0.50
+    no_target_accuracy: 0.25
+    attribute_accuracy: 0.15
+    relation_accuracy: 0.10
+
+runtime:
+  confidence: 0.25
+  top_k: 8
+  input_size: 320
+  prompt_cache: true
+  tracking:
+    enabled: true
+    iou_gate: 0.30
+    max_missed: 3
+    score_decay: 0.95
