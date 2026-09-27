@@ -4,6 +4,10 @@ data/
 logs/
 outputs/live_sessions/
 
+# Local virtual environments and secret overrides.
+.venv*/
+.env.local
+
 # Python and Jupyter transient files.
 __pycache__/
 *.py[cod]
