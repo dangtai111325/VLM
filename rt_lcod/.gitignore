@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local/generated research assets.
+data/images/
+data/manifests/
+data/candidate_cache/
+data/teacher_cache/
+data/robot/
+
+runs/*
+!runs/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+
+*.onnx
+*.engine
+*.plan
