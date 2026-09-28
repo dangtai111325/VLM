@@ -39,6 +39,18 @@ ATTRIBUTES = {
 }
 
 
+def coco_image_url(image: dict[str, Any]) -> str:
+    """Resolve the official COCO image URL for either the train or validation split."""
+    declared = str(image.get("coco_url") or "").strip()
+    if declared:
+        return declared.replace("http://", "https://", 1)
+    file_name = str(image.get("file_name") or "")
+    match = re.search(r"COCO_(train|val)2014_", file_name)
+    if not match:
+        raise ValueError(f"cannot infer COCO split from file_name={file_name!r}")
+    return f"https://images.cocodataset.org/{match.group(1)}2014/{file_name}"
+
+
 def _listify(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -255,6 +267,7 @@ def _build_pool(
             {
                 "id": f"gref_{ref['ref_id']}_{len(records)}",
                 "image": f"images/train2014/{image['file_name']}",
+                "coco_url": coco_image_url(image),
                 "width": int(image["width"]),
                 "height": int(image["height"]),
                 "prompt": sentence,
@@ -283,26 +296,33 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def _download_one(
     image_dir: Path,
     file_name: str,
+    source_url: str,
     timeout: float = 30.0,
 ) -> tuple[str, str]:
     output = image_dir / file_name
     if output.exists() and output.stat().st_size > 1024:
         return file_name, "cached"
     output.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://images.cocodataset.org/train2014/{file_name}"
+    temporary = output.with_suffix(output.suffix + ".part")
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            response = requests.get(url, timeout=timeout)
+            response = requests.get(
+                source_url,
+                timeout=timeout,
+                headers={"User-Agent": "rt-lcod-colab-data-prep/0.2"},
+            )
             response.raise_for_status()
-            output.write_bytes(response.content)
-            if output.stat().st_size <= 1024:
+            temporary.write_bytes(response.content)
+            if temporary.stat().st_size <= 1024:
                 raise RuntimeError("downloaded file is unexpectedly small")
+            temporary.replace(output)
             return file_name, "downloaded"
         except Exception as exc:
             last_error = exc
+            temporary.unlink(missing_ok=True)
             time.sleep(1.5 * (attempt + 1))
-    return file_name, f"failed:{type(last_error).__name__}:{last_error}"
+    return file_name, f"failed:url={source_url}: {type(last_error).__name__}:{last_error}"
 
 
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -383,7 +403,12 @@ def main() -> None:
         print(f"[DATA] {split} build: {json.dumps(build_stats, ensure_ascii=False)}")
         print(f"[DATA] manifest={manifest}")
 
-    files = sorted({Path(row["image"]).name for rows in splits.values() for row in rows})
+    image_urls = {
+        Path(row["image"]).name: str(row["coco_url"])
+        for rows in splits.values()
+        for row in rows
+    }
+    files = sorted(image_urls.items())
     image_dir = root / "images" / "train2014"
     downloaded = cached = failed = 0
     print(
@@ -391,7 +416,10 @@ def main() -> None:
         f"with {args.workers} workers"
     )
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = [executor.submit(_download_one, image_dir, name) for name in files]
+        futures = [
+            executor.submit(_download_one, image_dir, name, source_url)
+            for name, source_url in files
+        ]
         for index, future in enumerate(as_completed(futures), 1):
             name, state = future.result()
             if state == "downloaded":
