@@ -18,6 +18,21 @@ def test_parse_class_only():
     assert parsed.relation is None
 
 
+def test_parse_multiword_class():
+    parsed = RuleSlotParser().parse("red fire extinguisher")
+    assert parsed.target_class == "fire extinguisher"
+    assert parsed.attribute == "red"
+    assert parsed.relation is None
+
+
+def test_parse_multiword_relation_reference():
+    parsed = RuleSlotParser().parse("white fire extinguisher to the left of traffic light")
+    assert parsed.target_class == "fire extinguisher"
+    assert parsed.attribute == "white"
+    assert parsed.relation == "left_of"
+    assert parsed.reference_class == "traffic light"
+
+
 def test_empty_prompt_rejected():
     with pytest.raises(ValueError):
         RuleSlotParser().parse("   ")
