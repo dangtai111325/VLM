@@ -19,12 +19,19 @@ rt_lcod/checkpoints/*
 !rt_lcod/checkpoints/.gitkeep
 rt_lcod/artifacts/*
 !rt_lcod/artifacts/.gitkeep
-rt_lcod/data/raw/
-rt_lcod/data/cache/
 rt_lcod/cache/
 rt_lcod/logs/
 
-# Model files
+# Run All datasets and derived caches stay local
+rt_lcod/data/raw/
+rt_lcod/data/images/
+rt_lcod/data/manifests/
+rt_lcod/data/candidate_cache/
+rt_lcod/data/teacher_cache/
+rt_lcod/data/data_report.json
+rt_lcod/data/demo.mp4
+
+# Model/export files
 *.pt
 *.pth
 *.onnx
