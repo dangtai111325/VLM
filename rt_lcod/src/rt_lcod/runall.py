@@ -293,12 +293,15 @@ class RunAll:
         self._gpu("after-stage2")
         self._finish("train_stage2", started)
 
-    @staticmethod
-    def _composite(metrics: dict[str, Any]) -> float:
+    def _composite(self, metrics: dict[str, Any]) -> float:
+        """Return the validation score declared in the active YAML config."""
         target = float(metrics.get("target_top1_accuracy", 0.0))
         no_target = metrics.get("no_target_accuracy", 0.0)
         no_target = 0.0 if no_target is None or no_target != no_target else float(no_target)
-        return 0.70 * target + 0.30 * no_target
+        weights = self.config.validation.get("composite", {})
+        target_weight = float(weights.get("target_top1_accuracy", 0.70))
+        no_target_weight = float(weights.get("no_target_accuracy", 0.30))
+        return target_weight * target + no_target_weight * no_target
 
     def select_final_on_validation(self) -> Path:
         started = self._banner("Session 8 — validation model selection")
