@@ -1,54 +1,73 @@
 # RT-LCOD — Real-Time Language-Conditioned Object Detection
 
-This branch is dedicated to the RT-LCOD research project for robot perception.
+This branch implements one concrete V1 architecture:
 
-## Architecture
+**YOLOE-26M open-vocabulary detector + lightweight attribute/relation grounding head + explicit NO_TARGET + Grounding DINO teacher distillation.**
 
-**YOLOE-26M open-vocabulary detector + lightweight attribute/relation grounding head + explicit NO_TARGET rejection + Grounding DINO teacher distillation.**
+Grounding DINO is training-only. Deployment keeps YOLOE plus the small student head.
 
-Runtime is intentionally lightweight: heavy teacher models are used offline during training only.
+## V1 prompt contract
 
-## Scope V1
-
-Each prompt contains:
-
-- one target class;
-- zero or one attribute;
-- zero or one first-order relation;
-- zero or one reference object class;
-- optional no-target outcome when the full condition is not satisfied.
+A prompt contains one target class, optionally one simple attribute, and optionally one first-order relation plus one reference class.
 
 Examples:
 
 - `cup`
 - `red cup`
-- `red cup next to pillow`
+- `fire extinguisher`
+- `red car next to bus`
 - `bottle left of laptop`
 
-Second-order relation chains are out of scope for V1.
+Second-order relation chains are intentionally out of scope for V1.
+
+## T4 Run All notebook
+
+Open:
+
+`rt_lcod/notebooks/rt_lcod_end_to_end.ipynb`
+
+On an NVIDIA T4, **Run All now executes the real pipeline** rather than the old synthetic-only notebook:
+
+```text
+gRefCOCO subset
+  -> train / val / held-out test manifests
+  -> YOLOE-26M proposal cache
+  -> frozen region/text feature cache
+  -> Stage 1 supervised grounding training
+  -> Stage 1 validation
+  -> Grounding DINO offline teacher cache
+  -> Stage 2 knowledge distillation
+  -> choose Stage 1 vs Stage 2 on validation
+  -> held-out final test
+  -> load final checkpoint
+  -> interactive video player + prompt textbox
+```
+
+Default T4 baseline sizes are deliberately bounded: 2,000 train, 300 validation, 300 test, and at most 800 teacher samples. Change them only after collecting the first full set of logs.
+
+## Logs kept for optimization
+
+The notebook and scripts print/store environment, GPU/VRAM, data statistics, proposal recall, losses, target/no-target accuracy, checkpoints, elapsed times, cache statistics and video latency. Video inference reports detector/region/head latency plus mean/p50/p95/p99 and processing FPS.
+
+Generated datasets, caches, checkpoints and model files stay local and are gitignored.
 
 ## Repository layout
 
-- `plan.md` — full research and implementation plan
-- `rt_lcod/` — complete training/inference project
-- `rt_lcod/notebooks/rt_lcod_end_to_end.ipynb` — staged research notebook
-- `.github/workflows/rt_lcod_ci.yml` — CI smoke validation
+- `plan.md` — broader research plan
+- `rt_lcod/configs/t4_runall.yaml` — T4 baseline profile
+- `rt_lcod/scripts/prepare_grefcoco.py` — real dataset preparation
+- `rt_lcod/src/rt_lcod/runall.py` — one-click orchestrator
+- `rt_lcod/src/rt_lcod/inference/video_ui.py` — video/prompt UI
+- `rt_lcod/notebooks/rt_lcod_end_to_end.ipynb` — main entry point
+- `.github/workflows/rt_lcod_ci.yml` — CPU smoke/unit CI
 
-## Quick start
+## Local development smoke test
 
 ```bash
 cd rt_lcod
-python -m pip install -e .[dev]
+python -m pip install -e .[all]
 python scripts/smoke_test.py
 pytest -q
 ```
 
-Then open:
-
-`rt_lcod/notebooks/rt_lcod_end_to_end.ipynb`
-
-Keep `RUN_HEAVY=False` first. Enable heavy stages only after the synthetic smoke path passes.
-
-## Validation status
-
-The branch includes unit tests, synthetic forward/backward validation, checkpoint/resume tests, timing instrumentation, and CI. Full YOLOE/Grounding-DINO CUDA validation must be run on the target GPU environment.
+CPU CI validates software contracts. YOLOE/Grounding-DINO training speed and final accuracy must be measured on the actual T4 run; the notebook is instrumented specifically to capture those values.
