@@ -50,6 +50,16 @@ class MobileNetV3RegionEncoder(nn.Module):
         model = mobilenet_v3_small(weights=weights)
         self.backbone = model.features
         self.stride = 32
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(False)
         self.backbone.eval()
@@ -65,7 +75,9 @@ class MobileNetV3RegionEncoder(nn.Module):
         images: torch.Tensor,
         boxes_per_image: list[torch.Tensor],
     ) -> list[torch.Tensor]:
-        return _roi_features(self.backbone(images), boxes_per_image, self.stride)
+        # Callers provide RGB float tensors in [0, 1]. Match torchvision ImageNet weights.
+        normalized = (images - self.image_mean) / self.image_std
+        return _roi_features(self.backbone(normalized), boxes_per_image, self.stride)
 
 
 def _roi_features(
