@@ -66,19 +66,34 @@ def main() -> None:
             max_candidates=min(config.model.top_k, 8), seed=config.seed, include_teacher=True,
         )
         val_ds = SyntheticGroundingDataset(
-            size=16, visual_dim=config.model.visual_dim, text_dim=config.model.text_dim,
-            max_candidates=min(config.model.top_k, 8), seed=config.seed + 1000, include_teacher=True,
+            size=16,
+            visual_dim=config.model.visual_dim,
+            text_dim=config.model.text_dim,
+            max_candidates=min(
+                config.model.top_k,
+                8),
+            seed=config.seed + 1000,
+            include_teacher=True,
         )
     else:
         if not args.train_cache or not args.val_cache:
-            raise SystemExit("--train-cache and --val-cache are required unless --synthetic is used")
+            raise SystemExit(
+                "--train-cache and --val-cache are required unless --synthetic is used")
         train_ds = CachedGroundingDataset(args.train_cache)
         val_ds = CachedGroundingDataset(args.val_cache)
         if args.teacher_cache:
             train_ds = TeacherMergedDataset(train_ds, args.teacher_cache)
 
-    train_loader = make_loader(train_ds, config.training.batch_size, config.training.num_workers, shuffle=True)
-    val_loader = make_loader(val_ds, config.training.batch_size, config.training.num_workers, shuffle=False)
+    train_loader = make_loader(
+        train_ds,
+        config.training.batch_size,
+        config.training.num_workers,
+        shuffle=True)
+    val_loader = make_loader(
+        val_ds,
+        config.training.batch_size,
+        config.training.num_workers,
+        shuffle=False)
     model = RTLCODStudent(config.model)
     logger = RunLogger(args.runs_root, args.run_name or config.run_name)
     trainer = Trainer(model, config, logger)

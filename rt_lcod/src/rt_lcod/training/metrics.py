@@ -10,9 +10,12 @@ def batch_metrics(logits: torch.Tensor, target_index: torch.Tensor) -> dict[str,
     correct = (pred == target_index).float().mean().item()
     negatives = target_index == no_target_index
     positives = ~negatives
-    no_target_acc = (pred[negatives] == no_target_index).float().mean().item() if negatives.any() else float("nan")
-    positive_acc = (pred[positives] == target_index[positives]).float().mean().item() if positives.any() else float("nan")
-    false_positive_rate = (pred[negatives] != no_target_index).float().mean().item() if negatives.any() else float("nan")
+    no_target_acc = (pred[negatives] == no_target_index).float(
+    ).mean().item() if negatives.any() else float("nan")
+    positive_acc = (pred[positives] == target_index[positives]).float(
+    ).mean().item() if positives.any() else float("nan")
+    false_positive_rate = (pred[negatives] != no_target_index).float(
+    ).mean().item() if negatives.any() else float("nan")
     return {
         "target_top1_accuracy": correct,
         "positive_target_accuracy": positive_acc,

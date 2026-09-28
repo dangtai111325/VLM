@@ -47,5 +47,9 @@ class YOLOECandidateGenerator:
         for box in result.boxes:
             xyxy = tuple(float(x) for x in box.xyxy[0].detach().cpu().tolist())
             class_id = int(box.cls[0])
-            detections.append(Detection(box=xyxy, score=float(box.conf[0]), label=str(result.names[class_id])))
+            detections.append(
+                Detection(
+                    box=xyxy, score=float(
+                        box.conf[0]), label=str(
+                        result.names[class_id])))
         return detections

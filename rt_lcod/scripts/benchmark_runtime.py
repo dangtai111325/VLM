@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from rt_lcod.config import load_config
 from rt_lcod.inference.runtime import RTLCODRuntime
@@ -44,7 +45,9 @@ def main() -> None:
     no_target_count = 0
     measured = 0
     try:
-        for frame_index in range(args.warmup + args.frames):
+        total_frames = args.warmup + args.frames
+        progress = tqdm(range(total_frames), desc="runtime benchmark", unit="frame", dynamic_ncols=True)
+        for frame_index in progress:
             ok, frame = capture.read()
             if not ok:
                 break
@@ -58,6 +61,11 @@ def main() -> None:
             no_target_count += int(result.box is None)
             for key, value in result.timings_ms.items():
                 component.setdefault(key, []).append(float(value))
+            progress.set_postfix(
+                mean_ms=f"{np.mean(latencies):.1f}",
+                fps=f"{1000.0 / np.mean(latencies):.1f}",
+                no_target=no_target_count,
+            )
     finally:
         capture.release()
 

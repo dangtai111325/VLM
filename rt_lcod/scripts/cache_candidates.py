@@ -7,6 +7,7 @@ import re
 import numpy as np
 from PIL import Image
 import torch
+from tqdm.auto import tqdm
 
 from rt_lcod.config import load_config
 from rt_lcod.data.schema import load_manifest
@@ -54,51 +55,64 @@ def main() -> None:
         device=device_name,
         imgsz=int(config.runtime.get("input_size", 640)),
     )
-    region_encoder = build_region_encoder(config.model.region_encoder, visual_dim=config.model.visual_dim).to(device).eval()
+    region_encoder = build_region_encoder(
+        config.model.region_encoder,
+        visual_dim=config.model.visual_dim).to(device).eval()
     text_encoder = HFTextEncoder(config.model.text_model_name, device=device_name)
 
     skipped = 0
-    for index, sample in enumerate(samples, 1):
+    cached_count = 0
+    progress = tqdm(samples, desc="cache candidates", unit="sample", dynamic_ncols=True)
+    for index, sample in enumerate(progress, 1):
         image_path = (Path(args.manifest).parent / sample.image).resolve()
         if not image_path.exists():
             image_path = Path(sample.image).resolve()
         image = Image.open(image_path).convert("RGB")
         array = np.asarray(image)
         bgr = np.ascontiguousarray(array[..., ::-1])
-        classes = [sample.target_class] + ([sample.reference_class] if sample.reference_class else [])
+        classes = [sample.target_class] + \
+            ([sample.reference_class] if sample.reference_class else [])
         detections = detector.predict(bgr, classes, conf=args.confidence)
         detections = sorted(detections, key=lambda d: d.score, reverse=True)[: args.max_candidates]
         if not detections:
             skipped += 1
+            progress.set_postfix(cached=cached_count, skipped=skipped)
             continue
 
         boxes_px = torch.tensor([d.box for d in detections], dtype=torch.float32, device=device)
-        image_tensor = torch.from_numpy(np.ascontiguousarray(array)).to(device).float().permute(2, 0, 1)[None] / 255.0
+        image_tensor = torch.from_numpy(
+            np.ascontiguousarray(array)).to(device).float().permute(
+            2, 0, 1)[None] / 255.0
         with torch.inference_mode():
             features = region_encoder(image_tensor, [boxes_px])[0].cpu()
         norm = boxes_px.detach().cpu().clone()
         norm[:, [0, 2]] /= sample.width
         norm[:, [1, 3]] /= sample.height
         labels = [d.label.lower().strip() for d in detections]
-        target_mask = torch.tensor([x == sample.target_class.lower() for x in labels], dtype=torch.bool)
-        reference_mask = torch.tensor([bool(sample.reference_class) and x == sample.reference_class.lower() for x in labels], dtype=torch.bool)
+        target_mask = torch.tensor([x == sample.target_class.lower()
+                                   for x in labels], dtype=torch.bool)
+        reference_mask = torch.tensor([bool(sample.reference_class) and x ==
+                                      sample.reference_class.lower() for x in labels], dtype=torch.bool)
 
         target_index = -1
         best_iou = 0.0
         if not sample.no_target:
             candidate_indices = torch.where(target_mask)[0]
             if candidate_indices.numel():
-                matched_local, best_iou = best_match(boxes_px[candidate_indices], sample.target_boxes, args.min_match_iou)
+                matched_local, best_iou = best_match(
+                    boxes_px[candidate_indices], sample.target_boxes, args.min_match_iou)
                 if matched_local >= 0:
                     target_index = int(candidate_indices[matched_local])
             if target_index < 0:
                 skipped += 1
+                progress.set_postfix(cached=cached_count, skipped=skipped)
                 continue
 
         relation_reference_target_mask = torch.zeros(len(detections), dtype=torch.bool)
         if sample.relation and sample.reference_boxes and reference_mask.any():
             ref_indices = torch.where(reference_mask)[0]
-            matched_local, _ = best_match(boxes_px[ref_indices], sample.reference_boxes, args.min_match_iou)
+            matched_local, _ = best_match(
+                boxes_px[ref_indices], sample.reference_boxes, args.min_match_iou)
             if matched_local >= 0:
                 relation_reference_target_mask[int(ref_indices[matched_local])] = True
 
@@ -123,8 +137,8 @@ def main() -> None:
             "prompt": sample.prompt,
         }
         torch.save(record, output / f"{safe_name(sample.sample_id)}.pt")
-        if index % 50 == 0:
-            print(f"processed {index}/{len(samples)}; skipped={skipped}")
+        cached_count += 1
+        progress.set_postfix(cached=cached_count, skipped=skipped)
     print(f"done: total={len(samples)} cached={len(list(output.glob('*.pt')))} skipped={skipped}")
 
 

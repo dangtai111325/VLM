@@ -27,7 +27,12 @@ def test_checkpoint_roundtrip(tmp_path: Path):
     restored = RTLCODStudent(config.model)
     optimizer2 = torch.optim.AdamW(restored.parameters(), lr=1e-3)
     scheduler2 = torch.optim.lr_scheduler.StepLR(optimizer2, step_size=1)
-    state = load_checkpoint(path, model=restored, optimizer=optimizer2, scheduler=scheduler2, restore_rng=False)
+    state = load_checkpoint(
+        path,
+        model=restored,
+        optimizer=optimizer2,
+        scheduler=scheduler2,
+        restore_rng=False)
     assert state["epoch"] == 3
     assert state["global_step"] == 12
     for a, b in zip(model.parameters(), restored.parameters()):

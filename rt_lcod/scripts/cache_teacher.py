@@ -6,6 +6,7 @@ import re
 
 from PIL import Image
 import torch
+from tqdm.auto import tqdm
 
 from rt_lcod.data.schema import load_manifest
 from rt_lcod.geometry import box_iou_xyxy
@@ -37,9 +38,14 @@ def main() -> None:
     candidate_root = Path(args.candidate_cache)
     samples = load_manifest(args.manifest)
 
-    for index, sample in enumerate(samples, 1):
+    cached_count = 0
+    skipped = 0
+    progress = tqdm(samples, desc="cache teacher", unit="sample", dynamic_ncols=True)
+    for sample in progress:
         candidate_path = candidate_root / f"{safe_name(sample.sample_id)}.pt"
         if not candidate_path.exists():
+            skipped += 1
+            progress.set_postfix(cached=cached_count, skipped=skipped)
             continue
         cached = torch.load(candidate_path, map_location="cpu", weights_only=False)
         boxes_norm = cached["boxes"].float()
@@ -49,7 +55,10 @@ def main() -> None:
         image_path = (Path(args.manifest).parent / sample.image).resolve()
         if not image_path.exists():
             image_path = Path(sample.image).resolve()
-        detections = teacher.predict(Image.open(image_path).convert("RGB"), sample.prompt, args.threshold)
+        detections = teacher.predict(
+            Image.open(image_path).convert("RGB"),
+            sample.prompt,
+            args.threshold)
 
         n = boxes_px.shape[0]
         candidate_scores = torch.zeros(n, dtype=torch.float32)
@@ -58,14 +67,16 @@ def main() -> None:
             iou = box_iou_xyxy(boxes_px, teacher_box)
             candidate_scores = torch.maximum(candidate_scores, iou * float(det.score))
         none_score = max(0.05, 1.0 - float(candidate_scores.max()) if n else 1.0)
-        logits = torch.cat([candidate_scores, torch.tensor([none_score])]) / max(args.temperature, 1e-4)
+        logits = torch.cat([candidate_scores, torch.tensor([none_score])]) / \
+            max(args.temperature, 1e-4)
         distribution = torch.softmax(logits, dim=0)
         torch.save(
             {"sample_id": sample.sample_id, "teacher_distribution": distribution},
             output / f"{safe_name(sample.sample_id)}.pt",
         )
-        if index % 50 == 0:
-            print(f"teacher cached {index}/{len(samples)}")
+        cached_count += 1
+        progress.set_postfix(cached=cached_count, skipped=skipped)
+    print(f"done: total={len(samples)} cached={cached_count} skipped={skipped}")
 
 
 if __name__ == "__main__":

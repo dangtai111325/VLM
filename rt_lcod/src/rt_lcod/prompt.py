@@ -88,7 +88,7 @@ class RuleSlotParser:
         relation_surface = match.group(1).lower()
         relation = self.relations[relation_surface]
         left = raw[: match.start()]
-        right = raw[match.end() :]
+        right = raw[match.end():]
         target, attribute = self._noun_phrase(self._clean_tokens(left))
         reference, _ = self._noun_phrase(self._clean_tokens(right))
         if target is None or reference is None:

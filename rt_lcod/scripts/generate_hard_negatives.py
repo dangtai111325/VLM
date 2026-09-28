@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import random
 
+from tqdm.auto import tqdm
+
 from rt_lcod.data.schema import load_manifest
 
 
@@ -26,23 +28,42 @@ def replace_slot(sample, slot: str, new_value: str):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate candidate hard-negative prompts. Verification is required before training.")
+    parser = argparse.ArgumentParser(
+        description="Generate candidate hard-negative prompts. Verification is required before training.")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--attributes", nargs="*", default=["red", "blue", "green", "black", "white"])
-    parser.add_argument("--relations", nargs="*", default=["next_to", "left_of", "right_of", "above", "below"])
+    parser.add_argument(
+        "--attributes",
+        nargs="*",
+        default=[
+            "red",
+            "blue",
+            "green",
+            "black",
+            "white"])
+    parser.add_argument(
+        "--relations",
+        nargs="*",
+        default=[
+            "next_to",
+            "left_of",
+            "right_of",
+            "above",
+            "below"])
     parser.add_argument("--classes", nargs="*", default=[])
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
     samples = load_manifest(args.manifest)
     rng = random.Random(args.seed)
-    classes = args.classes or sorted({s.target_class for s in samples} | {s.reference_class for s in samples if s.reference_class})
+    classes = args.classes or sorted({s.target_class for s in samples} | {
+                                     s.reference_class for s in samples if s.reference_class})
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     written = 0
     with output.open("w", encoding="utf-8") as handle:
-        for sample in samples:
+        progress = tqdm(samples, desc="generate hard negatives", unit="sample", dynamic_ncols=True)
+        for sample in progress:
             mutations = []
             choices = [x for x in classes if x != sample.target_class]
             if choices:
@@ -71,6 +92,7 @@ def main() -> None:
                 }
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 written += 1
+            progress.set_postfix(candidates=written)
     print(f"wrote {written} candidate negatives to {output}")
     print("IMPORTANT: verify each candidate against annotations before using it as no-target supervision.")
 

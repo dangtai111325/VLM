@@ -673,7 +673,7 @@ python scripts/evaluate.py \
 python scripts/benchmark_runtime.py \
   --config configs/base.yaml \
   --checkpoint runs/<run>/checkpoints/best.pt \
-  --video ../data/videos/highway_traffic_gpl.mp4 \
+  --video ../test.mp4 \
   --prompt "red cup next to pillow"
 ```
 

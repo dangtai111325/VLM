@@ -29,13 +29,15 @@ class RunLogger:
     def write_json(self, name: str, payload: Any) -> None:
         if is_dataclass(payload):
             payload = asdict(payload)
-        (self.run_dir / name).write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+        (self.run_dir / name).write_text(json.dumps(payload, indent=2,
+                                                    ensure_ascii=False, default=str) + "\n", encoding="utf-8")
 
     def log_metrics(self, payload: dict[str, Any]) -> None:
         record = {"timestamp_utc": datetime.now(timezone.utc).isoformat(), **payload}
         with self.metrics_jsonl.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        flat = {k: v for k, v in record.items() if isinstance(v, (str, int, float, bool)) or v is None}
+        flat = {k: v for k, v in record.items() if isinstance(
+            v, (str, int, float, bool)) or v is None}
         with self.metrics_csv.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(flat))
             if not self._csv_header_written:
@@ -46,7 +48,8 @@ class RunLogger:
 
 def environment_snapshot() -> dict[str, Any]:
     try:
-        git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
         git_commit = None
     return {

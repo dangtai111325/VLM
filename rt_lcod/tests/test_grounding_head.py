@@ -9,7 +9,11 @@ from rt_lcod.training.losses import compute_loss
 
 def test_forward_and_backward():
     config = load_config("configs/smoke.yaml")
-    ds = SyntheticGroundingDataset(size=4, visual_dim=config.model.visual_dim, text_dim=config.model.text_dim, seed=13)
+    ds = SyntheticGroundingDataset(
+        size=4,
+        visual_dim=config.model.visual_dim,
+        text_dim=config.model.text_dim,
+        seed=13)
     batch = collate_cached([ds[0], ds[1], ds[2]])
     model = RTLCODStudent(config.model)
     output = model(batch)

@@ -38,10 +38,18 @@ def main() -> None:
     assert float(geom[0, 0]) < 0
 
     train_ds = SyntheticGroundingDataset(
-        size=16, visual_dim=config.model.visual_dim, text_dim=config.model.text_dim, max_candidates=6, seed=config.seed,
+        size=16,
+        visual_dim=config.model.visual_dim,
+        text_dim=config.model.text_dim,
+        max_candidates=6,
+        seed=config.seed,
     )
     val_ds = SyntheticGroundingDataset(
-        size=8, visual_dim=config.model.visual_dim, text_dim=config.model.text_dim, max_candidates=6, seed=config.seed + 100,
+        size=8,
+        visual_dim=config.model.visual_dim,
+        text_dim=config.model.text_dim,
+        max_candidates=6,
+        seed=config.seed + 100,
     )
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=collate_cached)
     val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, collate_fn=collate_cached)

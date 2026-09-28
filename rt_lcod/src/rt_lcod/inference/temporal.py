@@ -33,7 +33,8 @@ class SimpleTargetTracker:
         self._next_id += 1
         return self.state
 
-    def update(self, detections: list[tuple[tuple[float, float, float, float], float]]) -> TrackState | None:
+    def update(self, detections: list[tuple[tuple[float, float,
+               float, float], float]]) -> TrackState | None:
         if self.state is None:
             if not detections:
                 return None

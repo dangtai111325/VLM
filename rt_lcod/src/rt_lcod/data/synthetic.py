@@ -9,7 +9,14 @@ from torch.utils.data import Dataset
 class SyntheticGroundingDataset(Dataset):
     """Small deterministic dataset for smoke tests and CI."""
 
-    def __init__(self, size: int = 32, visual_dim: int = 32, text_dim: int = 24, max_candidates: int = 6, seed: int = 7, include_teacher: bool = True):
+    def __init__(
+            self,
+            size: int = 32,
+            visual_dim: int = 32,
+            text_dim: int = 24,
+            max_candidates: int = 6,
+            seed: int = 7,
+            include_teacher: bool = True):
         self.size = int(size)
         self.visual_dim = int(visual_dim)
         self.text_dim = int(text_dim)
@@ -57,11 +64,19 @@ class SyntheticGroundingDataset(Dataset):
                 features[target_index, :signal_dim] += rel[:signal_dim] * 0.25
 
         item = {
-            "sample_id": f"synthetic_{index:04d}", "features": features.float(), "boxes": boxes.float(),
-            "detector_scores": scores.float(), "candidate_mask": candidate_mask, "target_index": target_index,
-            "attribute_embedding": attr.float(), "relation_embedding": rel.float(),
-            "has_attribute": has_attribute, "has_relation": has_relation,
-            "reference_mask": reference_mask, "target_mask": target_mask,
+            "sample_id": f"synthetic_{
+                index:04d}",
+            "features": features.float(),
+            "boxes": boxes.float(),
+            "detector_scores": scores.float(),
+            "candidate_mask": candidate_mask,
+            "target_index": target_index,
+            "attribute_embedding": attr.float(),
+            "relation_embedding": rel.float(),
+            "has_attribute": has_attribute,
+            "has_relation": has_relation,
+            "reference_mask": reference_mask,
+            "target_mask": target_mask,
         }
         if self.include_teacher:
             teacher = torch.zeros(n + 1)

@@ -16,7 +16,8 @@ class TeacherDetection:
 class GroundingDINOTeacher:
     """Offline-only Grounding DINO teacher wrapper for pseudo labels/distillation."""
 
-    def __init__(self, model_name: str = "IDEA-Research/grounding-dino-base", device: str = "cuda", dtype: torch.dtype | None = None):
+    def __init__(self, model_name: str = "IDEA-Research/grounding-dino-base",
+                 device: str = "cuda", dtype: torch.dtype | None = None):
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
         self.processor = AutoProcessor.from_pretrained(model_name)
         kwargs = {}
