@@ -52,3 +52,12 @@ def test_coco_image_url_uses_declared_or_inferred_split():
             "coco_url": "http://images.cocodataset.org/train2014/COCO_train2014_000000123456.jpg",
         }
     ) == "https://images.cocodataset.org/train2014/COCO_train2014_000000123456.jpg"
+
+
+def test_coco_image_url_prefers_direct_cdn_over_mscoco_redirect():
+    assert module.coco_image_url(
+        {
+            "file_name": "COCO_val2014_000000123456.jpg",
+            "coco_url": "https://mscoco.org/images/123456",
+        }
+    ) == "https://images.cocodataset.org/val2014/COCO_val2014_000000123456.jpg"

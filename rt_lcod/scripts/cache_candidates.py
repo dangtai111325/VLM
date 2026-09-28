@@ -48,7 +48,7 @@ def best_match(candidate_boxes: torch.Tensor, gt_boxes: list[list[float]], min_i
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/t4_runall.yaml")
+    parser.add_argument("--config", default="configs/local_a3000.yaml")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model", default=None)

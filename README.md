@@ -20,13 +20,13 @@ Examples:
 
 Second-order relation chains are intentionally out of scope for V1.
 
-## T4 Run All notebook
+## Local RTX Run All notebook
 
 Open:
 
 `rt_lcod/notebooks/rt_lcod_end_to_end.ipynb`
 
-On an NVIDIA T4, **Run All now executes the real pipeline** rather than the old synthetic-only notebook:
+On the local RTX A3000, **Run All executes the real pipeline** rather than the old synthetic-only notebook:
 
 ```text
 gRefCOCO subset
@@ -43,7 +43,7 @@ gRefCOCO subset
   -> interactive video player + prompt textbox
 ```
 
-Default T4 baseline sizes are deliberately bounded: 2,000 train, 300 validation, 300 test, and at most 800 teacher samples. Change them only after collecting the first full set of logs.
+Default local baseline sizes are deliberately bounded: 1,000 train, 150 validation, 150 test, and at most 300 teacher samples. Change them only after collecting the first full set of logs.
 
 ## Logs kept for optimization
 
@@ -54,7 +54,7 @@ Generated datasets, caches, checkpoints and model files stay local and are gitig
 ## Repository layout
 
 - `plan.md` — broader research plan
-- `rt_lcod/configs/t4_runall.yaml` — T4 baseline profile
+- `rt_lcod/configs/local_a3000.yaml` — RTX A3000 baseline profile
 - `rt_lcod/scripts/prepare_grefcoco.py` — real dataset preparation
 - `rt_lcod/src/rt_lcod/runall.py` — one-click orchestrator
 - `rt_lcod/src/rt_lcod/inference/video_ui.py` — video/prompt UI
@@ -70,4 +70,4 @@ python scripts/smoke_test.py
 pytest -q
 ```
 
-CPU CI validates software contracts. YOLOE/Grounding-DINO training speed and final accuracy must be measured on the actual T4 run; the notebook is instrumented specifically to capture those values.
+CPU CI validates software contracts. YOLOE/Grounding-DINO training speed and final accuracy must be measured on the local RTX A3000 run; the notebook is instrumented specifically to capture those values.

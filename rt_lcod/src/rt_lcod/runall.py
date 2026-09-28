@@ -28,7 +28,7 @@ class RunAllState:
 
 
 class RunAll:
-    """One-kernel orchestration for the T4 RT-LCOD notebook.
+    """One-kernel orchestration for the local RTX A3000 RT-LCOD notebook.
 
     Heavy detector/teacher work is launched in child processes. This keeps GPU memory
     predictable and makes every stage independently resumable from files on disk.
@@ -43,8 +43,9 @@ class RunAll:
         teacher_max_samples: int = 800,
         run_teacher: bool = True,
         rebuild_candidate_cache: bool = False,
-        config_name: str | Path = "t4_runall",
+        config_name: str | Path = "local_a3000",
         data_download_workers: int = 12,
+        prefer_http_coco: bool = False,
     ) -> None:
         self.root = Path(root).resolve()
         config_path = Path(config_name)
@@ -69,6 +70,7 @@ class RunAll:
         self.run_teacher = bool(run_teacher)
         self.rebuild_candidate_cache = bool(rebuild_candidate_cache)
         self.data_download_workers = max(1, int(data_download_workers))
+        self.prefer_http_coco = bool(prefer_http_coco)
         self.state = RunAllState()
         self.runtime = None
 
@@ -112,14 +114,14 @@ class RunAll:
         print(f"[RUNALL] state={path}")
 
     def preflight(self) -> None:
-        started = self._banner("Session 1 — T4/GPU preflight")
+        started = self._banner("Session 1 — GPU/CUDA preflight")
         print(f"[ENV] root={self.root}")
         print(f"[ENV] python={sys.version.replace(chr(10), ' ')}")
         print(f"[ENV] platform={platform.platform()}")
         print(f"[ENV] torch={torch.__version__} cuda_runtime={torch.version.cuda}")
         print(f"[ENV] cuda_available={torch.cuda.is_available()}")
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required. Select an NVIDIA T4 runtime and restart the notebook.")
+            raise RuntimeError("CUDA is required. Start Jupyter with the prepared Python 3.14 RTX runtime.")
         print(f"[ENV] gpu={torch.cuda.get_device_name(0)}")
         try:
             print(subprocess.check_output(
@@ -138,7 +140,7 @@ class RunAll:
 
     def prepare_data(self) -> None:
         started = self._banner("Session 2 — download/prepare gRefCOCO")
-        self._cmd([
+        command: list[Any] = [
             sys.executable,
             "scripts/prepare_grefcoco.py",
             "--root", self.data,
@@ -148,7 +150,12 @@ class RunAll:
             "--seed", self.config.seed,
             "--negative-fraction", 0.30,
             "--workers", self.data_download_workers,
-        ])
+            "--allow-http-fallback",
+        ]
+        if self.prefer_http_coco:
+            command.append("--prefer-http-coco")
+            print("[DATA][WARN] using public HTTP COCO download due to the configured local network TLS issue")
+        self._cmd(command)
         for split in ("train", "val", "test"):
             manifest = self.data / "manifests" / f"{split}.jsonl"
             self._cmd([sys.executable, "scripts/validate_manifest.py", "--manifest", manifest])
@@ -206,7 +213,7 @@ class RunAll:
     def train_stage1(self) -> None:
         started = self._banner("Session 4 — Stage 1 supervised student training")
         self.runs.mkdir(exist_ok=True)
-        before = set(self.runs.glob("*_stage1_t4"))
+        before = set(self.runs.glob("*_stage1_local"))
         self._cmd([
             sys.executable,
             "scripts/train.py",
@@ -214,9 +221,9 @@ class RunAll:
             "--train-cache", self.cache_root / "train",
             "--val-cache", self.cache_root / "val",
             "--runs-root", self.runs,
-            "--run-name", "stage1_t4",
+            "--run-name", "stage1_local",
         ])
-        run = self._latest_new_run("*_stage1_t4", before)
+        run = self._latest_new_run("*_stage1_local", before)
         checkpoint = run / "checkpoints" / "best.pt"
         self.state.stage1_run = str(run)
         self.state.stage1_checkpoint = str(checkpoint)
@@ -280,7 +287,7 @@ class RunAll:
             return
         if not self.state.stage1_checkpoint:
             raise RuntimeError("run train_stage1() first")
-        before = set(self.runs.glob("*_stage2_kd_t4"))
+        before = set(self.runs.glob("*_stage2_kd_local"))
         self._cmd([
             sys.executable,
             "scripts/train.py",
@@ -290,9 +297,9 @@ class RunAll:
             "--teacher-cache", self.teacher_cache,
             "--init-checkpoint", self.state.stage1_checkpoint,
             "--runs-root", self.runs,
-            "--run-name", "stage2_kd_t4",
+            "--run-name", "stage2_kd_local",
         ])
-        run = self._latest_new_run("*_stage2_kd_t4", before)
+        run = self._latest_new_run("*_stage2_kd_local", before)
         checkpoint = run / "checkpoints" / "best.pt"
         self.state.stage2_run = str(run)
         self.state.stage2_checkpoint = str(checkpoint)

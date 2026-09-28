@@ -41,14 +41,17 @@ ATTRIBUTES = {
 
 def coco_image_url(image: dict[str, Any]) -> str:
     """Resolve the official COCO image URL for either the train or validation split."""
+    file_name = str(image.get("file_name") or "")
+    match = re.search(r"COCO_(train|val)2014_", file_name)
+    if match:
+        # gRefCOCO metadata often declares mscoco.org/images/<id>, which is a
+        # redirect endpoint and can time out.  The filename deterministically
+        # identifies the faster, direct COCO CDN object.
+        return f"https://images.cocodataset.org/{match.group(1)}2014/{file_name}"
     declared = str(image.get("coco_url") or "").strip()
     if declared:
         return declared.replace("http://", "https://", 1)
-    file_name = str(image.get("file_name") or "")
-    match = re.search(r"COCO_(train|val)2014_", file_name)
-    if not match:
-        raise ValueError(f"cannot infer COCO split from file_name={file_name!r}")
-    return f"https://images.cocodataset.org/{match.group(1)}2014/{file_name}"
+    raise ValueError(f"cannot infer COCO split from file_name={file_name!r}")
 
 
 def _listify(value: Any) -> list[Any]:
@@ -297,6 +300,7 @@ def _download_one(
     image_dir: Path,
     file_name: str,
     source_url: str,
+    allow_http_fallback: bool = False,
     timeout: float = 30.0,
 ) -> tuple[str, str]:
     output = image_dir / file_name
@@ -310,7 +314,7 @@ def _download_one(
             response = requests.get(
                 source_url,
                 timeout=timeout,
-                headers={"User-Agent": "rt-lcod-colab-data-prep/0.2"},
+                headers={"User-Agent": "rt-lcod-local-data-prep/0.2"},
             )
             response.raise_for_status()
             temporary.write_bytes(response.content)
@@ -318,6 +322,28 @@ def _download_one(
                 raise RuntimeError("downloaded file is unexpectedly small")
             temporary.replace(output)
             return file_name, "downloaded"
+        except requests.exceptions.SSLError as exc:
+            last_error = exc
+            fallback_url = source_url.replace("https://", "http://", 1)
+            if not allow_http_fallback or fallback_url == source_url:
+                temporary.unlink(missing_ok=True)
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            try:
+                response = requests.get(
+                    fallback_url,
+                    timeout=timeout,
+                    headers={"User-Agent": "rt-lcod-local-data-prep/0.2"},
+                )
+                response.raise_for_status()
+                temporary.write_bytes(response.content)
+                if temporary.stat().st_size <= 1024:
+                    raise RuntimeError("fallback download is unexpectedly small")
+                temporary.replace(output)
+                return file_name, "downloaded_http_fallback"
+            except Exception as fallback_exc:
+                last_error = fallback_exc
+                temporary.unlink(missing_ok=True)
         except Exception as exc:
             last_error = exc
             temporary.unlink(missing_ok=True)
@@ -341,7 +367,7 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prepare a T4-sized, V1-compatible gRefCOCO subset for RT-LCOD."
+        description="Prepare a local RTX-sized, V1-compatible gRefCOCO subset for RT-LCOD."
     )
     parser.add_argument("--root", default="data")
     parser.add_argument("--train", type=int, default=2000)
@@ -350,6 +376,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--negative-fraction", type=float, default=0.30)
     parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument(
+        "--allow-http-fallback",
+        action="store_true",
+        help="use public HTTP COCO URLs only when HTTPS fails certificate validation",
+    )
+    parser.add_argument(
+        "--prefer-http-coco",
+        action="store_true",
+        help="use public HTTP COCO URLs directly (only for networks with a known HTTPS certificate mismatch)",
+    )
     args = parser.parse_args()
 
     started = time.perf_counter()
@@ -371,59 +407,121 @@ def main() -> None:
         f"images={len(images):,} categories={len(categories)}"
     )
 
-    split_specs = {
-        "train": ({"train"}, args.train, args.seed),
-        "val": ({"val"}, args.val, args.seed + 1),
-        "test": ({"testA", "testB"}, args.test, args.seed + 2),
-    }
-    splits: dict[str, list[dict[str, Any]]] = {}
-    build_reports: dict[str, dict[str, int]] = {}
-    for split, (source_splits, limit, split_seed) in split_specs.items():
-        rows, build_stats = _build_pool(
-            refs,
-            source_splits,
-            annotations,
-            annotations_by_image,
-            categories,
-            category_ids,
-            images,
-            limit,
-            split_seed,
-            args.negative_fraction,
+    # gRefCOCO's official ``val`` split is almost entirely no-target prompts.  It is
+    # valuable for rejection evaluation, but cannot serve as the only validation
+    # signal for target grounding.  Build one shuffled, V1-compatible pool from the
+    # official train refs, then split it once into disjoint train/validation records.
+    # The held-out test remains strictly from official testA/testB refs.
+    train_val_total = args.train + args.val
+    train_val_rows, train_val_build = _build_pool(
+        refs,
+        {"train"},
+        annotations,
+        annotations_by_image,
+        categories,
+        category_ids,
+        images,
+        train_val_total,
+        args.seed,
+        args.negative_fraction,
+    )
+    if len(train_val_rows) < train_val_total:
+        raise RuntimeError(
+            f"train/validation pool requested={train_val_total} produced={len(train_val_rows)}"
         )
-        if not rows:
-            raise RuntimeError(f"no usable rows produced for split={split}")
-        if len(rows) < limit:
-            print(f"[DATA][WARN] split={split} requested={limit} produced={len(rows)}")
-        splits[split] = rows
-        build_reports[split] = build_stats
+
+    test_rows, test_build = _build_pool(
+        refs,
+        {"testA", "testB"},
+        annotations,
+        annotations_by_image,
+        categories,
+        category_ids,
+        images,
+        args.test,
+        args.seed + 2,
+        args.negative_fraction,
+    )
+    if len(test_rows) < args.test:
+        raise RuntimeError(f"test pool requested={args.test} produced={len(test_rows)}")
+
+    # Stratify the local validation split explicitly.  Taking a contiguous slice
+    # after pool construction can concentrate all no-target rows in train because
+    # the pool's negative quota is reached early.
+    split_rng = random.Random(args.seed + 1)
+    positives = [row for row in train_val_rows if not row["no_target"]]
+    negatives = [row for row in train_val_rows if row["no_target"]]
+    split_rng.shuffle(positives)
+    split_rng.shuffle(negatives)
+    train_negative_count = int(args.train * args.negative_fraction)
+    val_negative_count = int(args.val * args.negative_fraction)
+    train_positive_count = args.train - train_negative_count
+    val_positive_count = args.val - val_negative_count
+    if len(positives) < train_positive_count + val_positive_count:
+        raise RuntimeError("insufficient positive rows for the requested train/validation split")
+    if len(negatives) < train_negative_count + val_negative_count:
+        raise RuntimeError("insufficient no-target rows for the requested train/validation split")
+    train_rows = (
+        positives[:train_positive_count]
+        + negatives[:train_negative_count]
+    )
+    val_rows = (
+        positives[train_positive_count : train_positive_count + val_positive_count]
+        + negatives[train_negative_count : train_negative_count + val_negative_count]
+    )
+    split_rng.shuffle(train_rows)
+    split_rng.shuffle(val_rows)
+    splits: dict[str, list[dict[str, Any]]] = {
+        "train": train_rows,
+        "val": val_rows,
+        "test": test_rows,
+    }
+    build_reports: dict[str, dict[str, Any]] = {
+        "train_val_source": train_val_build,
+        "test_source": test_build,
+    }
+    for split, rows in splits.items():
         manifest = root / "manifests" / f"{split}.jsonl"
         _write_jsonl(manifest, rows)
         print(f"[DATA] {split}: {json.dumps(_stats(rows), ensure_ascii=False)}")
-        print(f"[DATA] {split} build: {json.dumps(build_stats, ensure_ascii=False)}")
         print(f"[DATA] manifest={manifest}")
+    print(f"[DATA] train/val source build: {json.dumps(train_val_build, ensure_ascii=False)}")
+    print(f"[DATA] test source build: {json.dumps(test_build, ensure_ascii=False)}")
 
     image_urls = {
-        Path(row["image"]).name: str(row["coco_url"])
+        Path(row["image"]).name: (
+            str(row["coco_url"]).replace("https://", "http://", 1)
+            if args.prefer_http_coco
+            else str(row["coco_url"])
+        )
         for rows in splits.values()
         for row in rows
     }
     files = sorted(image_urls.items())
     image_dir = root / "images" / "train2014"
-    downloaded = cached = failed = 0
+    downloaded = cached = http_fallback = failed = 0
     print(
         f"[DATA] downloading/checking {len(files):,} unique COCO images "
         f"with {args.workers} workers"
     )
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = [
-            executor.submit(_download_one, image_dir, name, source_url)
+            executor.submit(
+                _download_one,
+                image_dir,
+                name,
+                source_url,
+                args.allow_http_fallback,
+            )
             for name, source_url in files
         ]
         for index, future in enumerate(as_completed(futures), 1):
             name, state = future.result()
             if state == "downloaded":
                 downloaded += 1
+            elif state == "downloaded_http_fallback":
+                downloaded += 1
+                http_fallback += 1
             elif state == "cached":
                 cached += 1
             else:
@@ -432,7 +530,7 @@ def main() -> None:
             if index % 100 == 0 or index == len(futures):
                 print(
                     f"[DATA] images {index}/{len(futures)} downloaded={downloaded} "
-                    f"cached={cached} failed={failed}"
+                    f"cached={cached} http_fallback={http_fallback} failed={failed}"
                 )
     if failed:
         raise RuntimeError(f"{failed} image downloads failed; rerun the cell to resume")
@@ -447,6 +545,7 @@ def main() -> None:
             "unique": len(files),
             "downloaded": downloaded,
             "cached": cached,
+            "http_fallback": http_fallback,
             "failed": failed,
         },
         "elapsed_s": time.perf_counter() - started,

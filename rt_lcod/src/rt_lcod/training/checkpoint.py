@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
+import time
 from typing import Any
 
 import numpy as np
@@ -46,7 +47,17 @@ def save_checkpoint(path: str | Path,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
-    tmp.replace(path)
+    # Windows antivirus/indexing can hold either checkpoint for a few milliseconds.
+    # Keep the atomic replace semantics, but tolerate transient sharing violations so
+    # a long local training run is not lost at the checkpoint boundary.
+    for attempt in range(5):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 def load_checkpoint(path: str | Path,

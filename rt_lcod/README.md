@@ -8,11 +8,11 @@ The final video runtime does not contain Grounding DINO.
 
 ## Recommended entry point
 
-Use `notebooks/rt_lcod_end_to_end.ipynb` on an NVIDIA T4 and choose **Run All**.
+Open `notebooks/rt_lcod_end_to_end.ipynb` with the `Python 3.14 (LCOD)` kernel on the local RTX A3000 and choose **Run All**.
 
 The notebook automatically:
 
-1. checks CUDA/T4 and prints environment/VRAM;
+1. checks CUDA/RTX A3000 and prints environment/VRAM;
 2. downloads a bounded real gRefCOCO subset and required COCO images;
 3. builds train/validation/held-out test manifests;
 4. runs YOLOE-26M once per sample and caches candidate/region/text features;
@@ -25,11 +25,11 @@ The notebook automatically:
 11. loads the final video runtime;
 12. displays a video path box, prompt box and Play/Pause/Stop controls.
 
-Default T4 profile is `configs/t4_runall.yaml`.
+Default local profile is `configs/local_a3000.yaml`.
 
 ## Why only gRefCOCO in the default Run All?
 
-The broader research plan includes RefCOCO+/RefCOCOg, Visual Genome, OmniLabel and robot-domain data. The first executable baseline intentionally uses one real dataset that already provides referring expressions and true no-target examples. Additional datasets should be introduced only after the first T4 logs identify the actual bottleneck.
+The broader research plan includes RefCOCO+/RefCOCOg, Visual Genome, OmniLabel and robot-domain data. The first executable baseline intentionally uses one real dataset that already provides referring expressions and true no-target examples. Additional datasets should be introduced only after the first local RTX logs identify the actual bottleneck.
 
 ## Generated files
 
@@ -43,4 +43,4 @@ python scripts/smoke_test.py
 pytest -q
 ```
 
-These validate the software path. They do not substitute for the full T4 experiment.
+These validate the software path. They do not substitute for the full local RTX experiment.

@@ -26,7 +26,7 @@ class RuntimeResult:
 
 
 class RTLCODRuntime:
-    """End-to-end deployment wrapper with prompt caching and measured T4 latency."""
+    """End-to-end deployment wrapper with prompt caching and measured local RTX latency."""
 
     def __init__(
         self,
