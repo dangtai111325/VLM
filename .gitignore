@@ -1,14 +1,32 @@
-# Local models, package caches, and downloaded media are intentionally local.
-cache/
-data/
-logs/
-outputs/live_sessions/
-
-# Local virtual environments and secret overrides.
-.venv*/
-.env.local
-
-# Python and Jupyter transient files.
+# RT-LCOD branch: local/generated files only
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local secrets
+.venv/
+.venv*/
+.env
+.env.local
+
+# Training/runtime outputs
+rt_lcod/runs/*
+!rt_lcod/runs/.gitkeep
+rt_lcod/checkpoints/*
+!rt_lcod/checkpoints/.gitkeep
+rt_lcod/artifacts/*
+!rt_lcod/artifacts/.gitkeep
+rt_lcod/data/raw/
+rt_lcod/data/cache/
+rt_lcod/cache/
+rt_lcod/logs/
+
+# Model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
