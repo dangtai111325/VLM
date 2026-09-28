@@ -11,6 +11,7 @@ from rt_lcod.config import load_config
 from rt_lcod.data.cached_dataset import CachedGroundingDataset, collate_cached
 from rt_lcod.data.synthetic import SyntheticGroundingDataset
 from rt_lcod.models.student import RTLCODStudent
+from rt_lcod.training.checkpoint import load_checkpoint
 from rt_lcod.training.trainer import Trainer
 from rt_lcod.utils.logging import RunLogger
 from rt_lcod.utils.seed import seed_everything
@@ -70,9 +71,12 @@ def main() -> None:
     parser.add_argument("--teacher-cache")
     parser.add_argument("--runs-root", default="runs")
     parser.add_argument("--run-name", default=None)
-    parser.add_argument("--resume")
+    parser.add_argument("--resume", help="resume a run including optimizer/scheduler/epoch")
+    parser.add_argument("--init-checkpoint", help="load model weights only and start a fresh training stage")
     parser.add_argument("--synthetic", action="store_true")
     args = parser.parse_args()
+    if args.resume and args.init_checkpoint:
+        raise SystemExit("choose either --resume or --init-checkpoint, not both")
 
     config = load_config(args.config)
     seed_everything(config.seed)
@@ -117,6 +121,9 @@ def main() -> None:
     train_loader = make_loader(train_ds, config.training.batch_size, config.training.num_workers, shuffle=True)
     val_loader = make_loader(val_ds, config.training.batch_size, config.training.num_workers, shuffle=False)
     model = RTLCODStudent(config.model)
+    if args.init_checkpoint:
+        print(f"[TRAIN] initializing model weights from={Path(args.init_checkpoint).resolve()}")
+        load_checkpoint(args.init_checkpoint, model=model, map_location="cpu", restore_rng=False)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"[TRAIN] student_params={total:,} trainable={trainable:,}")
@@ -124,7 +131,7 @@ def main() -> None:
     logger = RunLogger(args.runs_root, args.run_name or config.run_name)
     trainer = Trainer(model, config, logger)
     if args.resume:
-        print(f"[TRAIN] resuming={Path(args.resume).resolve()}")
+        print(f"[TRAIN] resuming full training state from={Path(args.resume).resolve()}")
         trainer.resume(args.resume)
     best = trainer.fit(train_loader, val_loader)
     print(f"[TRAIN] run_dir={logger.run_dir}")
