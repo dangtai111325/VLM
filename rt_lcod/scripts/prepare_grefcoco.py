@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
@@ -32,10 +32,11 @@ RELATIONS = {
     "inside": "inside",
     "overlapping": "overlapping",
 }
-ATTRIBUTES = [
+ATTRIBUTES = {
     "black", "white", "red", "green", "blue", "yellow", "orange", "purple", "pink",
     "brown", "gray", "grey", "small", "large", "big", "little", "tall", "short",
-]
+    "dark", "light",
+}
 
 
 def _listify(value: Any) -> list[Any]:
@@ -53,22 +54,38 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text) is not None
 
 
-def extract_slots(sentence: str, target_class: str, category_names: list[str]) -> tuple[str | None, str | None, str | None]:
-    """Extract at most one attribute and one one-hop spatial relation.
+def extract_slots(
+    sentence: str,
+    target_class: str,
+    category_names: list[str],
+) -> tuple[str | None, str | None, str | None]:
+    """Extract the locked V1 slots without pretending to parse unrestricted language.
 
-    The target class comes from gRefCOCO/COCO annotations, not from this heuristic.
-    This keeps training labels stable while still respecting the V1 prompt contract.
+    Target class is supplied by gRefCOCO/COCO annotation. Attribute is accepted only
+    when a supported adjective immediately precedes the mentioned target class. A
+    relation is accepted only if its tail explicitly mentions another COCO class.
     """
     text = sentence.lower().strip()
-    attribute = next((a for a in ATTRIBUTES if _contains_phrase(text, a)), None)
-    relation = None
-    reference = None
+    attribute: str | None = None
+
+    target_match = re.search(r"(?<!\w)" + re.escape(target_class.lower()) + r"(?!\w)", text)
+    if target_match:
+        prefix_tokens = re.findall(r"[\w'-]+", text[: target_match.start()])
+        if prefix_tokens and prefix_tokens[-1] in ATTRIBUTES:
+            attribute = prefix_tokens[-1]
+
+    relation: str | None = None
+    reference: str | None = None
     for surface, canonical in sorted(RELATIONS.items(), key=lambda item: len(item[0]), reverse=True):
         match = re.search(r"(?<!\w)" + re.escape(surface) + r"(?!\w)", text)
         if not match:
             continue
-        tail = text[match.end():]
-        candidates = [c for c in category_names if c != target_class and _contains_phrase(tail, c.lower())]
+        tail = text[match.end() :]
+        candidates = [
+            category
+            for category in category_names
+            if category != target_class and _contains_phrase(tail, category.lower())
+        ]
         if candidates:
             reference = max(candidates, key=len)
             relation = canonical
@@ -80,16 +97,30 @@ def _pick_sentence(ref: dict[str, Any], rng: random.Random) -> str | None:
     sentences = ref.get("sentences") or []
     if not sentences:
         return None
-    values = [str(s.get("sent") or s.get("raw") or "").strip() for s in sentences]
-    values = [v for v in values if v]
+    values = [str(item.get("sent") or item.get("raw") or "").strip() for item in sentences]
+    values = [value for value in values if value]
     return rng.choice(values) if values else None
 
 
 def _download_metadata(raw_dir: Path) -> tuple[Path, Path]:
     raw_dir.mkdir(parents=True, exist_ok=True)
     print(f"[DATA] metadata source: https://huggingface.co/datasets/{HF_REPO}")
-    refs = Path(hf_hub_download(HF_REPO, "grefs(unc).json", repo_type="dataset", local_dir=raw_dir))
-    instances = Path(hf_hub_download(HF_REPO, "instances.json", repo_type="dataset", local_dir=raw_dir))
+    refs = Path(
+        hf_hub_download(
+            HF_REPO,
+            "grefs(unc).json",
+            repo_type="dataset",
+            local_dir=raw_dir,
+        )
+    )
+    instances = Path(
+        hf_hub_download(
+            HF_REPO,
+            "instances.json",
+            repo_type="dataset",
+            local_dir=raw_dir,
+        )
+    )
     print(f"[DATA] refs={refs} ({refs.stat().st_size / 2**20:.1f} MiB)")
     print(f"[DATA] instances={instances} ({instances.stat().st_size / 2**20:.1f} MiB)")
     return refs, instances
@@ -99,79 +130,147 @@ def _build_pool(
     refs: list[dict[str, Any]],
     split_names: set[str],
     annotations: dict[int, dict[str, Any]],
+    annotations_by_image: dict[int, list[dict[str, Any]]],
     categories: dict[int, str],
+    category_ids: dict[str, int],
     images: dict[int, dict[str, Any]],
     limit: int,
     seed: int,
     max_negative_fraction: float,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     rng = random.Random(seed)
-    candidates = [r for r in refs if str(r.get("split")) in split_names]
+    candidates = [ref for ref in refs if str(ref.get("split")) in split_names]
     rng.shuffle(candidates)
     category_names = sorted(set(categories.values()), key=len, reverse=True)
     records: list[dict[str, Any]] = []
     negative_count = 0
+    build_stats = {
+        "seen_refs": 0,
+        "skipped_multi_target": 0,
+        "skipped_negative_quota": 0,
+        "skipped_missing_image": 0,
+        "skipped_missing_sentence": 0,
+        "skipped_missing_target_class": 0,
+        "skipped_ambiguous_class_only": 0,
+        "verified_reference_boxes": 0,
+    }
 
     for ref in candidates:
         if len(records) >= limit:
             break
-        ann_ids = [int(x) for x in _listify(ref.get("ann_id")) if x is not None]
-        valid_ann_ids = [x for x in ann_ids if x >= 0 and x in annotations]
+        build_stats["seen_refs"] += 1
+        ann_ids = [int(value) for value in _listify(ref.get("ann_id")) if value is not None]
+        valid_ann_ids = [ann_id for ann_id in ann_ids if ann_id >= 0 and ann_id in annotations]
         no_target = len(valid_ann_ids) == 0
         if not no_target and len(valid_ann_ids) != 1:
-            # V1 is single-target only.
+            build_stats["skipped_multi_target"] += 1
             continue
         if no_target and negative_count >= max(1, int(limit * max_negative_fraction)):
+            build_stats["skipped_negative_quota"] += 1
             continue
 
         image_id = int(ref["image_id"])
         image = images.get(image_id)
         if not image:
+            build_stats["skipped_missing_image"] += 1
             continue
         sentence = _pick_sentence(ref, rng)
         if not sentence:
+            build_stats["skipped_missing_sentence"] += 1
             continue
 
+        target_ann: dict[str, Any] | None = None
+        target_category_id: int | None = None
         if no_target:
-            cat_ids = [int(x) for x in _listify(ref.get("category_id")) if str(x).lstrip("-").isdigit()]
-            valid_cats = [categories[x] for x in cat_ids if x in categories]
-            if valid_cats:
-                target_class = valid_cats[0]
+            cat_ids = [
+                int(value)
+                for value in _listify(ref.get("category_id"))
+                if str(value).lstrip("-").isdigit()
+            ]
+            valid_classes = [categories[value] for value in cat_ids if value in categories]
+            if valid_classes:
+                target_class = valid_classes[0]
+                target_category_id = category_ids.get(target_class)
             else:
-                mentioned = [c for c in category_names if _contains_phrase(sentence.lower(), c.lower())]
+                mentioned = [
+                    category
+                    for category in category_names
+                    if _contains_phrase(sentence.lower(), category.lower())
+                ]
                 if not mentioned:
+                    build_stats["skipped_missing_target_class"] += 1
                     continue
                 target_class = mentioned[0]
+                target_category_id = category_ids.get(target_class)
             target_boxes: list[list[float]] = []
-            negative_count += 1
         else:
-            ann = annotations[valid_ann_ids[0]]
-            target_class = categories.get(int(ann["category_id"]))
+            target_ann = annotations[valid_ann_ids[0]]
+            target_category_id = int(target_ann["category_id"])
+            target_class = categories.get(target_category_id)
             if not target_class:
+                build_stats["skipped_missing_target_class"] += 1
                 continue
-            target_boxes = [_xywh_to_xyxy(ann["bbox"])]
+            target_boxes = [_xywh_to_xyxy(target_ann["bbox"])]
 
-        attribute, relation, reference_class = extract_slots(sentence, target_class, category_names)
-        width, height = int(image["width"]), int(image["height"])
-        file_name = str(image["file_name"])
-        records.append({
-            "id": f"gref_{ref['ref_id']}_{len(records)}",
-            "image": f"images/train2014/{file_name}",
-            "width": width,
-            "height": height,
-            "prompt": sentence,
-            "slots": {
-                "target_class": target_class,
-                "attribute": attribute,
-                "relation": relation,
-                "reference_class": reference_class,
-            },
-            "target_boxes": target_boxes,
-            "reference_boxes": [],
-            "no_target": no_target,
-            "source": "gRefCOCO",
-        })
-    return records
+        attribute, relation, reference_class = extract_slots(
+            sentence,
+            target_class,
+            category_names,
+        )
+        image_annotations = annotations_by_image.get(image_id, [])
+
+        # If several objects of the target class are present but none of the V1 language
+        # slots can disambiguate them, the student has no learnable input for that choice.
+        # Skip such impossible supervision instead of injecting label noise.
+        if not no_target and target_category_id is not None:
+            same_class = [
+                ann
+                for ann in image_annotations
+                if int(ann.get("category_id", -1)) == target_category_id
+            ]
+            if len(same_class) > 1 and attribute is None and relation is None:
+                build_stats["skipped_ambiguous_class_only"] += 1
+                continue
+
+        reference_boxes: list[list[float]] = []
+        if relation and reference_class:
+            reference_category_id = category_ids.get(reference_class)
+            if reference_category_id is not None:
+                reference_annotations = [
+                    ann
+                    for ann in image_annotations
+                    if int(ann.get("category_id", -1)) == reference_category_id
+                    and (target_ann is None or int(ann["id"]) != int(target_ann["id"]))
+                ]
+                # Direct pairwise relation BCE is enabled only for an unambiguous single
+                # reference instance. Multiple references remain usable through L_target.
+                if len(reference_annotations) == 1:
+                    reference_boxes = [_xywh_to_xyxy(reference_annotations[0]["bbox"])]
+                    build_stats["verified_reference_boxes"] += 1
+
+        if no_target:
+            negative_count += 1
+
+        records.append(
+            {
+                "id": f"gref_{ref['ref_id']}_{len(records)}",
+                "image": f"images/train2014/{image['file_name']}",
+                "width": int(image["width"]),
+                "height": int(image["height"]),
+                "prompt": sentence,
+                "slots": {
+                    "target_class": target_class,
+                    "attribute": attribute,
+                    "relation": relation,
+                    "reference_class": reference_class,
+                },
+                "target_boxes": target_boxes,
+                "reference_boxes": reference_boxes,
+                "no_target": no_target,
+                "source": "gRefCOCO",
+            }
+        )
+    return records, build_stats
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -181,7 +280,11 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _download_one(image_dir: Path, file_name: str, timeout: float = 30.0) -> tuple[str, str]:
+def _download_one(
+    image_dir: Path,
+    file_name: str,
+    timeout: float = 30.0,
+) -> tuple[str, str]:
     output = image_dir / file_name
     if output.exists() and output.stat().st_size > 1024:
         return file_name, "cached"
@@ -203,20 +306,23 @@ def _download_one(image_dir: Path, file_name: str, timeout: float = 30.0) -> tup
 
 
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    categories = Counter(r["slots"]["target_class"] for r in rows)
+    category_counts = Counter(row["slots"]["target_class"] for row in rows)
     return {
         "samples": len(rows),
-        "positive": sum(not r["no_target"] for r in rows),
-        "no_target": sum(r["no_target"] for r in rows),
-        "with_attribute": sum(bool(r["slots"]["attribute"]) for r in rows),
-        "with_relation": sum(bool(r["slots"]["relation"]) for r in rows),
-        "unique_images": len({r["image"] for r in rows}),
-        "top_categories": categories.most_common(15),
+        "positive": sum(not row["no_target"] for row in rows),
+        "no_target": sum(row["no_target"] for row in rows),
+        "with_attribute": sum(bool(row["slots"]["attribute"]) for row in rows),
+        "with_relation": sum(bool(row["slots"]["relation"]) for row in rows),
+        "with_verified_reference_box": sum(bool(row["reference_boxes"]) for row in rows),
+        "unique_images": len({row["image"] for row in rows}),
+        "top_categories": category_counts.most_common(15),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare a T4-sized gRefCOCO subset for RT-LCOD.")
+    parser = argparse.ArgumentParser(
+        description="Prepare a T4-sized, V1-compatible gRefCOCO subset for RT-LCOD."
+    )
     parser.add_argument("--root", default="data")
     parser.add_argument("--train", type=int, default=2000)
     parser.add_argument("--val", type=int, default=300)
@@ -232,28 +338,58 @@ def main() -> None:
     refs_path, instances_path = _download_metadata(raw_dir)
     refs = json.loads(refs_path.read_text(encoding="utf-8"))
     instances = json.loads(instances_path.read_text(encoding="utf-8"))
-    annotations = {int(a["id"]): a for a in instances["annotations"]}
-    categories = {int(c["id"]): str(c["name"]) for c in instances["categories"]}
-    images = {int(i["id"]): i for i in instances["images"]}
-    print(f"[DATA] refs={len(refs):,} annotations={len(annotations):,} images={len(images):,} categories={len(categories)}")
 
-    splits = {
-        "train": _build_pool(refs, {"train"}, annotations, categories, images, args.train, args.seed, args.negative_fraction),
-        "val": _build_pool(refs, {"val"}, annotations, categories, images, args.val, args.seed + 1, args.negative_fraction),
-        "test": _build_pool(refs, {"testA", "testB"}, annotations, categories, images, args.test, args.seed + 2, args.negative_fraction),
+    annotations = {int(item["id"]): item for item in instances["annotations"]}
+    annotations_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for annotation in instances["annotations"]:
+        annotations_by_image[int(annotation["image_id"])].append(annotation)
+    categories = {int(item["id"]): str(item["name"]) for item in instances["categories"]}
+    category_ids = {name: category_id for category_id, name in categories.items()}
+    images = {int(item["id"]): item for item in instances["images"]}
+    print(
+        f"[DATA] refs={len(refs):,} annotations={len(annotations):,} "
+        f"images={len(images):,} categories={len(categories)}"
+    )
+
+    split_specs = {
+        "train": ({"train"}, args.train, args.seed),
+        "val": ({"val"}, args.val, args.seed + 1),
+        "test": ({"testA", "testB"}, args.test, args.seed + 2),
     }
-    for name, rows in splits.items():
+    splits: dict[str, list[dict[str, Any]]] = {}
+    build_reports: dict[str, dict[str, int]] = {}
+    for split, (source_splits, limit, split_seed) in split_specs.items():
+        rows, build_stats = _build_pool(
+            refs,
+            source_splits,
+            annotations,
+            annotations_by_image,
+            categories,
+            category_ids,
+            images,
+            limit,
+            split_seed,
+            args.negative_fraction,
+        )
         if not rows:
-            raise RuntimeError(f"no usable rows produced for split={name}")
-        manifest = root / "manifests" / f"{name}.jsonl"
+            raise RuntimeError(f"no usable rows produced for split={split}")
+        if len(rows) < limit:
+            print(f"[DATA][WARN] split={split} requested={limit} produced={len(rows)}")
+        splits[split] = rows
+        build_reports[split] = build_stats
+        manifest = root / "manifests" / f"{split}.jsonl"
         _write_jsonl(manifest, rows)
-        print(f"[DATA] {name}: {json.dumps(_stats(rows), ensure_ascii=False)}")
+        print(f"[DATA] {split}: {json.dumps(_stats(rows), ensure_ascii=False)}")
+        print(f"[DATA] {split} build: {json.dumps(build_stats, ensure_ascii=False)}")
         print(f"[DATA] manifest={manifest}")
 
-    files = sorted({Path(r["image"]).name for rows in splits.values() for r in rows})
+    files = sorted({Path(row["image"]).name for rows in splits.values() for row in rows})
     image_dir = root / "images" / "train2014"
     downloaded = cached = failed = 0
-    print(f"[DATA] downloading/checking {len(files):,} unique COCO images with {args.workers} workers")
+    print(
+        f"[DATA] downloading/checking {len(files):,} unique COCO images "
+        f"with {args.workers} workers"
+    )
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = [executor.submit(_download_one, image_dir, name) for name in files]
         for index, future in enumerate(as_completed(futures), 1):
@@ -266,7 +402,10 @@ def main() -> None:
                 failed += 1
                 print(f"[DATA][WARN] {name}: {state}")
             if index % 100 == 0 or index == len(futures):
-                print(f"[DATA] images {index}/{len(futures)} downloaded={downloaded} cached={cached} failed={failed}")
+                print(
+                    f"[DATA] images {index}/{len(futures)} downloaded={downloaded} "
+                    f"cached={cached} failed={failed}"
+                )
     if failed:
         raise RuntimeError(f"{failed} image downloads failed; rerun the cell to resume")
 
@@ -274,12 +413,21 @@ def main() -> None:
         "source": HF_REPO,
         "seed": args.seed,
         "requested": {"train": args.train, "val": args.val, "test": args.test},
-        "splits": {k: _stats(v) for k, v in splits.items()},
-        "images": {"unique": len(files), "downloaded": downloaded, "cached": cached, "failed": failed},
+        "splits": {name: _stats(rows) for name, rows in splits.items()},
+        "build_reports": build_reports,
+        "images": {
+            "unique": len(files),
+            "downloaded": downloaded,
+            "cached": cached,
+            "failed": failed,
+        },
         "elapsed_s": time.perf_counter() - started,
     }
     report_path = root / "data_report.json"
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     print(f"[DATA] complete in {report['elapsed_s']:.1f}s; report={report_path}")
 
 
