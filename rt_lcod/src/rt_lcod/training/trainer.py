@@ -326,13 +326,26 @@ class Trainer:
                 f"last={last_path} epoch_file={epoch_path} peak_gpu_mib={peak_gpu_mib:.1f}"
             )
 
+            elapsed_total_s = time.perf_counter() - started
+            completed_epochs = epoch - self.start_epoch + 1
+            remaining_epochs = self.config.training.epochs - epoch - 1
+            mean_epoch_s = elapsed_total_s / max(completed_epochs, 1)
+            eta_s = mean_epoch_s * remaining_epochs
+            print(
+                f"[PROGRESS] training epochs={epoch + 1}/{self.config.training.epochs} "
+                f"completed_pct={100 * (epoch + 1) / self.config.training.epochs:.1f} "
+                f"epoch_s={payload['epoch_s']:.1f} mean_epoch_s={mean_epoch_s:.1f} "
+                f"eta_m={eta_s / 60:.1f}"
+            )
+
             self.run_logger.write_json(
                 "run_state.json",
                 {
                     "epoch": epoch,
                     "global_step": self.global_step,
                     "best_metric": self.best_metric,
-                    "elapsed_s": time.perf_counter() - started,
+                    "elapsed_s": elapsed_total_s,
+                    "eta_s": eta_s,
                     "status": "running",
                 },
             )

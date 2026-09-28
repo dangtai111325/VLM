@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -33,6 +34,8 @@ class RunAll:
     Heavy detector/teacher work is launched in child processes. This keeps GPU memory
     predictable and makes every stage independently resumable from files on disk.
     """
+
+    TOTAL_SESSIONS = 11
 
     def __init__(
         self,
@@ -75,8 +78,15 @@ class RunAll:
         self.runtime = None
 
     def _banner(self, name: str) -> float:
+        match = re.search(r"Session\s+(\d+)", name)
+        session = int(match.group(1)) if match else None
         print("\n" + "=" * 96)
         print(f"[RUNALL] {name}")
+        if session is not None:
+            print(
+                f"[PROGRESS] pipeline_session={session}/{self.TOTAL_SESSIONS} "
+                f"completed={100 * (session - 1) / self.TOTAL_SESSIONS:.0f}%"
+            )
         print(f"[RUNALL] started={datetime.now().isoformat(timespec='seconds')}")
         print("=" * 96)
         return time.perf_counter()
@@ -86,11 +96,26 @@ class RunAll:
         print(f"[RUNALL] {name} completed elapsed_s={time.perf_counter() - started:.2f}")
         print("=" * 96)
 
-    def _cmd(self, args: list[Any]) -> None:
+    def _cmd(self, args: list[Any], label: str = "child process") -> None:
+        if label == "child process" and len(args) > 1:
+            label = Path(str(args[1])).stem
         print("[CMD]", " ".join(map(str, args)), flush=True)
         started = time.perf_counter()
-        completed = subprocess.run([str(x) for x in args], cwd=self.root, check=True)
-        print(f"[CMD] rc={completed.returncode} elapsed_s={time.perf_counter() - started:.2f}")
+        process = subprocess.Popen([str(x) for x in args], cwd=self.root)
+        next_heartbeat = 30.0
+        while process.poll() is None:
+            elapsed = time.perf_counter() - started
+            if elapsed >= next_heartbeat:
+                print(
+                    f"[PROGRESS] {label}: still_running elapsed_m={elapsed / 60:.1f}; "
+                    "use the script's tqdm/EPOCH line above for current percent and ETA.",
+                    flush=True,
+                )
+                next_heartbeat += 30.0
+            time.sleep(1.0)
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, [str(x) for x in args])
+        print(f"[CMD] {label}: rc=0 elapsed_s={time.perf_counter() - started:.2f}")
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
