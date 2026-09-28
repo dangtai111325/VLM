@@ -54,28 +54,38 @@ def compute_loss(
                 output.attribute_logits[attr_mask], attr_targets[attr_mask]
             )
 
+    # Only apply direct relation BCE when the dataset/cache contains a VERIFIED
+    # reference-object target. gRefCOCO expressions often provide the target box but
+    # not a separate GT box for the referenced object; those rows still train relation
+    # reasoning indirectly through L_target, but must not be mislabeled as all-negative pairs.
     relation = _zero_like(output.logits)
-    if batch["has_relation"].any() and "relation_reference_target_mask" in batch:
-        relation_targets = torch.zeros_like(output.relation_logits)
-        rows = torch.arange(output.logits.shape[0], device=output.logits.device)
-        valid = batch["has_relation"] & (batch["target_index"] < output.candidate_logits.shape[1])
-        for row in rows[valid].tolist():
-            relation_targets[
-                row,
-                batch["target_index"][row],
-                batch["relation_reference_target_mask"][row],
-            ] = 1.0
-        pair_mask = (
-            batch["candidate_mask"][:, :, None]
-            & batch["candidate_mask"][:, None, :]
-            & batch["target_mask"][:, :, None]
-            & batch["reference_mask"][:, None, :]
-            & batch["has_relation"][:, None, None]
+    relation_reference = batch.get("relation_reference_target_mask")
+    if relation_reference is not None:
+        verified_rows = (
+            batch["has_relation"]
+            & relation_reference.any(dim=1)
+            & (batch["target_index"] < output.candidate_logits.shape[1])
         )
-        if pair_mask.any():
-            relation = F.binary_cross_entropy_with_logits(
-                output.relation_logits[pair_mask], relation_targets[pair_mask]
+        if verified_rows.any():
+            relation_targets = torch.zeros_like(output.relation_logits)
+            rows = torch.where(verified_rows)[0]
+            for row in rows.tolist():
+                relation_targets[
+                    row,
+                    batch["target_index"][row],
+                    relation_reference[row],
+                ] = 1.0
+            pair_mask = (
+                batch["candidate_mask"][:, :, None]
+                & batch["candidate_mask"][:, None, :]
+                & batch["target_mask"][:, :, None]
+                & batch["reference_mask"][:, None, :]
+                & verified_rows[:, None, None]
             )
+            if pair_mask.any():
+                relation = F.binary_cross_entropy_with_logits(
+                    output.relation_logits[pair_mask], relation_targets[pair_mask]
+                )
 
     # Auxiliary calibration objective. NO_TARGET is already present in the main CE;
     # this smaller-weight BCE makes rejection easier to tune without dominating it.
@@ -89,15 +99,24 @@ def compute_loss(
         teacher = batch["teacher_distribution"][selected].to(output.logits.device).clone()
         candidate_allowed = (batch["candidate_mask"] & batch["target_mask"])[selected]
         allowed = torch.cat(
-            [candidate_allowed, torch.ones((teacher.shape[0], 1), dtype=torch.bool, device=teacher.device)],
+            [
+                candidate_allowed,
+                torch.ones((teacher.shape[0], 1), dtype=torch.bool, device=teacher.device),
+            ],
             dim=1,
         )
         teacher = teacher.masked_fill(~allowed, 0.0)
         teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        t = float(kd_temperature)
-        teacher_soft = F.softmax(torch.log(teacher.clamp_min(1e-8)) / t, dim=-1)
-        student_log = F.log_softmax(output.logits[selected] / t, dim=-1)
-        distillation = F.kl_div(student_log, teacher_soft, reduction="batchmean") * (t * t)
+        temperature = float(kd_temperature)
+        teacher_soft = F.softmax(
+            torch.log(teacher.clamp_min(1e-8)) / temperature,
+            dim=-1,
+        )
+        student_log = F.log_softmax(output.logits[selected] / temperature, dim=-1)
+        distillation = (
+            F.kl_div(student_log, teacher_soft, reduction="batchmean")
+            * (temperature * temperature)
+        )
 
     total = (
         weights.target * target
