@@ -16,7 +16,7 @@ class ModelConfig:
     dropout: float = 0.1
     top_k: int = 32
     region_encoder: str = "tiny"
-    detector_name: str = "yoloe-26m.pt"
+    detector_name: str = "yoloe-26m-seg.pt"
     text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
 
 
