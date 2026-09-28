@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -21,40 +20,43 @@ class ParsedPrompt:
 
 
 DEFAULT_RELATIONS = {
+    "to the left of": "left_of",
+    "left of": "left_of",
+    "to the right of": "right_of",
+    "right of": "right_of",
     "next to": "next_to",
     "beside": "next_to",
     "near": "near",
-    "left of": "left_of",
-    "to the left of": "left_of",
-    "right of": "right_of",
-    "to the right of": "right_of",
+    "in front of": "in_front_of",
+    "behind": "behind",
     "above": "above",
     "over": "above",
     "below": "below",
     "under": "below",
     "inside": "inside",
-    "in": "inside",
-    "on": "on",
+    "on top of": "on_top_of",
     "overlapping": "overlapping",
 }
 
-_STOPWORDS = {"the", "a", "an", "object", "thing"}
+ATTRIBUTE_WORDS = {
+    "black", "white", "red", "green", "blue", "yellow", "orange", "purple", "pink", "brown",
+    "gray", "grey", "small", "large", "big", "little", "tall", "short", "dark", "light",
+}
+_STOPWORDS = {"the", "a", "an", "object", "thing", "please", "find", "locate", "detect"}
 
 
 class RuleSlotParser:
-    """Deterministic V1 parser for one target, <=1 attribute and <=1 relation.
+    """Deterministic parser for the locked V1 contract.
 
-    This parser intentionally favors reproducibility over unrestricted NLP. It accepts
-    common English relation phrases and assumes the noun immediately before/after the
-    relation is the target/reference class. Tokens before the target noun are treated as
-    one attribute phrase. A trainable token tagger can replace this class later without
-    changing the grounding model API.
+    Contract: target class + at most one simple attribute + at most one first-order
+    relation + one reference class. Multiword classes such as ``fire extinguisher`` or
+    ``traffic light`` are preserved instead of being reduced to their final token.
     """
 
     def __init__(self, relations: dict[str, str] | None = None):
         self.relations = relations or DEFAULT_RELATIONS
         escaped = sorted((re.escape(k) for k in self.relations), key=len, reverse=True)
-        self.pattern = re.compile(r"\b(" + "|".join(escaped) + r")\b", re.IGNORECASE)
+        self.pattern = re.compile(r"(?<!\w)(" + "|".join(escaped) + r")(?!\w)", re.IGNORECASE)
 
     @staticmethod
     def _clean_tokens(text: str) -> list[str]:
@@ -62,13 +64,24 @@ class RuleSlotParser:
         return [t for t in tokens if t not in _STOPWORDS]
 
     @staticmethod
-    def _noun_phrase(tokens: Iterable[str]) -> tuple[str | None, str | None]:
-        values = list(tokens)
-        if not values:
+    def _target_phrase(text: str) -> tuple[str | None, str | None]:
+        tokens = RuleSlotParser._clean_tokens(text)
+        if not tokens:
             return None, None
-        target = values[-1]
-        attribute = " ".join(values[:-1]).strip() or None
+        attribute = None
+        if tokens and tokens[0] in ATTRIBUTE_WORDS:
+            attribute = tokens.pop(0)
+        target = " ".join(tokens).strip() or None
         return target, attribute
+
+    @staticmethod
+    def _reference_phrase(text: str) -> str | None:
+        tokens = RuleSlotParser._clean_tokens(text)
+        # A reference attribute is outside the V1 contract. Preserve the noun phrase but
+        # drop one leading simple adjective so YOLOE receives the object class itself.
+        if tokens and tokens[0] in ATTRIBUTE_WORDS:
+            tokens = tokens[1:]
+        return " ".join(tokens).strip() or None
 
     def parse(self, text: str) -> ParsedPrompt:
         raw = text.strip()
@@ -77,8 +90,7 @@ class RuleSlotParser:
 
         match = self.pattern.search(raw.lower())
         if match is None:
-            target_tokens = self._clean_tokens(raw)
-            target, attribute = self._noun_phrase(target_tokens)
+            target, attribute = self._target_phrase(raw)
             if target is None:
                 raise ValueError(f"cannot parse target class from: {text!r}")
             result = ParsedPrompt(raw=raw, target_class=target, attribute=attribute)
@@ -87,10 +99,8 @@ class RuleSlotParser:
 
         relation_surface = match.group(1).lower()
         relation = self.relations[relation_surface]
-        left = raw[: match.start()]
-        right = raw[match.end():]
-        target, attribute = self._noun_phrase(self._clean_tokens(left))
-        reference, _ = self._noun_phrase(self._clean_tokens(right))
+        target, attribute = self._target_phrase(raw[: match.start()])
+        reference = self._reference_phrase(raw[match.end():])
         if target is None or reference is None:
             raise ValueError(f"cannot parse one-hop relation from: {text!r}")
         result = ParsedPrompt(
