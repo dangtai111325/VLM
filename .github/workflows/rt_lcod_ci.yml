@@ -27,6 +27,21 @@ jobs:
       - name: Compile package
         working-directory: rt_lcod
         run: python -m compileall -q src scripts tests
+      - name: Validate Run All notebook JSON and code syntax
+        working-directory: rt_lcod
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import nbformat
+
+          path = Path("notebooks/rt_lcod_end_to_end.ipynb")
+          notebook = nbformat.read(path, as_version=4)
+          nbformat.validate(notebook)
+          code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
+          for index, cell in enumerate(code_cells):
+              compile(cell.source, f"{path}:code-cell-{index}", "exec")
+          print(f"Notebook validation PASS: {len(notebook.cells)} cells, {len(code_cells)} code cells")
+          PY
       - name: Run synthetic smoke test
         working-directory: rt_lcod
         run: python scripts/smoke_test.py
