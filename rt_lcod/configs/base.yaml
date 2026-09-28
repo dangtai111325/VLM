@@ -12,7 +12,7 @@ model:
   dropout: 0.10
   top_k: 32
   relation_feature_dim: 11
-  detector_name: yoloe-26m.pt
+  detector_name: yoloe-26m-seg.pt
   text_model_name: sentence-transformers/all-MiniLM-L6-v2
 
 training:
@@ -36,10 +36,8 @@ loss:
 validation:
   primary_metric: composite
   composite:
-    grounding_acc_iou50: 0.50
+    target_top1_accuracy: 0.75
     no_target_accuracy: 0.25
-    attribute_accuracy: 0.15
-    relation_accuracy: 0.10
 
 runtime:
   confidence: 0.25
