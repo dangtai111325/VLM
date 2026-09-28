@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -21,8 +23,10 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--cache")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--output")
     parser.add_argument("--synthetic", action="store_true")
     args = parser.parse_args()
+    started = time.perf_counter()
     config = load_config(args.config)
     requested = config.device
     if requested.startswith("cuda") and not torch.cuda.is_available():
@@ -33,20 +37,27 @@ def main() -> None:
             size=24,
             visual_dim=config.model.visual_dim,
             text_dim=config.model.text_dim,
-            seed=config.seed + 2000)
+            seed=config.seed + 2000,
+        )
     else:
         if not args.cache:
             raise SystemExit("--cache required unless --synthetic")
         dataset = CachedGroundingDataset(args.cache)
+    print("[EVAL] =============================================================")
+    print(f"[EVAL] checkpoint={Path(args.checkpoint).resolve()}")
+    print(f"[EVAL] samples={len(dataset):,} device={device}")
     loader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=collate_cached)
+        collate_fn=collate_cached,
+    )
     model = RTLCODStudent(config.model).to(device).eval()
     load_checkpoint(args.checkpoint, model=model, map_location=device, restore_rng=False)
     tracker = MetricTracker()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     with torch.inference_mode():
         progress = tqdm(loader, desc="evaluate", unit="batch", dynamic_ncols=True)
         for batch in progress:
@@ -55,7 +66,20 @@ def main() -> None:
             metrics = batch_metrics(output.logits, batch["target_index"])
             tracker.update(metrics, len(batch["target_index"]))
             progress.set_postfix(top1=f"{tracker.averages()['target_top1_accuracy']:.3f}")
-    print(json.dumps(tracker.averages(), indent=2))
+    report = {
+        **tracker.averages(),
+        "samples": len(dataset),
+        "elapsed_s": time.perf_counter() - started,
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "peak_gpu_mib": torch.cuda.max_memory_allocated() / 2**20 if torch.cuda.is_available() else 0.0,
+    }
+    print(json.dumps(report, indent=2))
+    if args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"[EVAL] report={path.resolve()}")
+    print("[EVAL] =============================================================")
 
 
 if __name__ == "__main__":
