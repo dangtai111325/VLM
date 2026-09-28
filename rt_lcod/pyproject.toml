@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rt-lcod"
-version = "0.1.0"
-description = "Real-time Language-Conditioned Object Detection research scaffold"
+version = "0.2.0"
+description = "Real-time Language-Conditioned Object Detection for T4 video inference"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
@@ -14,6 +14,8 @@ dependencies = [
   "PyYAML>=6.0",
   "tqdm>=4.66",
   "Pillow>=10.0",
+  "requests>=2.32",
+  "huggingface-hub>=0.35",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +26,6 @@ runtime = [
 ]
 teacher = ["transformers>=5.1,<6"]
 notebook = ["jupyter>=1.1", "ipywidgets>=8.1", "matplotlib>=3.9"]
-ui = ["gradio>=5.0", "opencv-python>=4.10"]
 dev = ["pytest>=8.0", "ruff>=0.8", "nbformat>=5.10"]
 all = [
   "opencv-python>=4.10",
@@ -33,7 +34,6 @@ all = [
   "jupyter>=1.1",
   "ipywidgets>=8.1",
   "matplotlib>=3.9",
-  "gradio>=5.0",
   "pytest>=8.0",
   "ruff>=0.8",
   "nbformat>=5.10",
