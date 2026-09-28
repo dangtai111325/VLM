@@ -43,9 +43,18 @@ class RunAll:
         teacher_max_samples: int = 800,
         run_teacher: bool = True,
         rebuild_candidate_cache: bool = False,
+        config_name: str | Path = "t4_runall",
+        data_download_workers: int = 12,
     ) -> None:
         self.root = Path(root).resolve()
-        self.config_path = self.root / "configs" / "t4_runall.yaml"
+        config_path = Path(config_name)
+        if config_path.suffix != ".yaml":
+            config_path = config_path.with_suffix(".yaml")
+        self.config_path = (
+            config_path if config_path.is_absolute() else self.root / "configs" / config_path
+        )
+        if not self.config_path.is_file():
+            raise FileNotFoundError(f"RunAll config not found: {self.config_path}")
         self.config: ExperimentConfig = load_config(self.config_path)
         self.data = self.root / "data"
         self.cache_root = self.data / "candidate_cache"
@@ -59,6 +68,7 @@ class RunAll:
         self.teacher_max_samples = int(teacher_max_samples)
         self.run_teacher = bool(run_teacher)
         self.rebuild_candidate_cache = bool(rebuild_candidate_cache)
+        self.data_download_workers = max(1, int(data_download_workers))
         self.state = RunAllState()
         self.runtime = None
 
@@ -137,7 +147,7 @@ class RunAll:
             "--test", self.test_samples,
             "--seed", self.config.seed,
             "--negative-fraction", 0.30,
-            "--workers", 12,
+            "--workers", self.data_download_workers,
         ])
         for split in ("train", "val", "test"):
             manifest = self.data / "manifests" / f"{split}.jsonl"

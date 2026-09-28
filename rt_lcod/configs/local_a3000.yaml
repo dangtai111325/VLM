@@ -1,0 +1,51 @@
+seed: 1337
+run_name: rt_lcod_a3000_12gb
+device: cuda
+amp: true
+
+# RTX A3000 Laptop GPU (12 GB): conservative detector resolution/candidate count.
+model:
+  visual_dim: 576
+  text_dim: 384
+  hidden_dim: 160
+  region_encoder: mobilenet_v3_small
+  dropout: 0.10
+  top_k: 16
+  relation_feature_dim: 11
+  detector_name: yoloe-26m-seg.pt
+  text_model_name: sentence-transformers/all-MiniLM-L6-v2
+
+training:
+  epochs: 8
+  batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  num_workers: 2
+  save_every_epochs: 1
+  early_stopping_patience: 3
+  kd_temperature: 2.0
+
+loss:
+  target: 1.0
+  attribute: 0.25
+  relation: 0.35
+  no_target: 0.25
+  distillation: 0.35
+
+validation:
+  primary_metric: composite
+  composite:
+    target_top1_accuracy: 0.70
+    no_target_accuracy: 0.30
+
+runtime:
+  confidence: 0.18
+  top_k: 16
+  input_size: 448
+  prompt_cache: true
+  tracking:
+    enabled: true
+    iou_gate: 0.30
+    max_missed: 5
+    score_decay: 0.95
