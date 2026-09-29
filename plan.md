@@ -1,729 +1,631 @@
-# RT-LCOD Project Plan
+# RT-LCOD / DOD — PLAN V3: End-to-End Final Model
 
-## 0. Project decision
+> Target machine: NVIDIA RTX A3000 12 GB (Precision laptop)
+>
+> Goal: one reproducible pipeline from raw public data to a final Described Object Detection (DOD) model. Input is an RGB image plus a free-form English description; output is 0, 1, or N bounding boxes satisfying the complete description.
 
-This branch implements one concrete architecture for **Language-Conditioned Object Detection (LCOD) for robot perception**:
+## 0. Locked decisions
 
-> **YOLOE-26M open-vocabulary detector + lightweight slot-based attribute/relation grounding head + explicit no-target rejection + Grounding DINO teacher distillation.**
+This branch no longer treats intermediate experiments as user-facing stages. Proposal diagnostics, coverage checks, calibration, and validation remain inside the pipeline as instrumentation, but a normal run proceeds end-to-end and produces a final model artifact.
 
-The deployment model is detector-centric. Heavy grounding/VLM models are used **offline during training only** and are not part of the robot runtime.
+The final system is intentionally not an end-to-end coordinate-generating VLM. It separates localization from language-conditioned reasoning so that localization can stay fast and the semantic model can be trained on a 12 GB GPU.
 
-The first research scope is intentionally constrained so it can be trained, debugged, benchmarked, and deployed:
+Locked design:
 
-- exactly one **target class**;
-- zero or one **attribute**;
-- zero or one **first-order relation**;
-- zero or one **reference object class** when a relation exists;
-- no second-order relation chains such as `cup next to pillow on the bed`;
-- explicit **no-target** output when the complete condition is not satisfied.
+1. **Prompt-independent proposal generation**: YOLOE-26s prompt-free is the default proposal source. It must not depend on the current command.
+2. **Detector-independent object tokens**: a frozen visual backbone plus RoIAlign converts each proposal into a per-object visual vector. We do not depend on undocumented YOLOE detection embeddings.
+3. **Frozen bidirectional text encoder**: DistilBERT is the default research-v1 encoder. It produces full-sentence token features and pooled entity/query features.
+4. **A0 generic branch**: object self-attention followed by text cross-attention gives every candidate a full-sentence score.
+5. **A1 structured branch**: target/anchor entity matching plus explicit pairwise geometry/relation compatibility gives a second candidate score.
+6. **Learned A0/A1 fusion**: the model learns how much structured reasoning to use. Parser failure therefore degrades toward A0 rather than crashing inference.
+7. **Explicit no-target/null head**: rejecting an absent target is a learned task, not merely a high candidate threshold.
+8. **Independent candidate sigmoid scores**: multi-target output is allowed by construction.
+9. **Validation-time calibration**: null and candidate decisions are calibrated on the validation split before final test reporting.
+10. **Cache expensive image computation**: detector and ROI features are computed once per unique image, saved to disk, then unloaded before DOD-core training.
 
-Examples in scope: `cup`, `red cup`, `red cup next to pillow`, `bottle left of laptop`, `small box under table`.
-
-Out of scope for V1: relation chains, multi-hop logic, counting constraints, temporal language, and free-form text generation.
-
----
-
-## 1. Success criteria
-
-The project is successful only if it improves the **joint** trade-off between detection coverage, prompt understanding, rejection reliability, and real-time behavior. The goal is not to beat every foundation model on every independent benchmark.
-
-### 1.1 Detection
-
-Retain as much of YOLOE's open-vocabulary detection capability as possible.
-
-Measure:
-
-- Recall@IoU=0.5;
-- mAP50 / mAP50:95 when annotations exist;
-- target proposal recall@K;
-- reference-object proposal recall@K;
-- held-out/novel-class performance after robot-domain adaptation.
-
-### 1.2 Language grounding
-
-The selected object must satisfy the **entire prompt**, not only the class noun.
-
-Measure:
-
-- target grounding accuracy at IoU >= 0.5;
-- top-1 target selection accuracy;
-- attribute accuracy;
-- relation accuracy;
-- no-target accuracy;
-- false-positive rate on negative prompts.
-
-### 1.3 Real-time performance
-
-For a 30 FPS source, the per-frame budget is approximately 33.3 ms.
-
-Report:
-
-- mean / median / p95 / p99 latency;
-- processing FPS;
-- source-frame deadline miss rate;
-- peak VRAM;
-- prompt-change latency separately from frame latency.
-
-### 1.4 Robot perception
-
-Report:
-
-- target acquisition success;
-- wrong-object selection rate;
-- no-target rejection rate;
-- reacquisition after occlusion/tracking loss;
-- pick/grasp success conditioned on correct perception;
-- end-to-end task success.
+Research v1 is English. Vietnamese is a later extension using either translation-to-English or a multilingual encoder after the English pipeline is stable.
 
 ---
 
-## 2. Final runtime architecture
+# 1. Task contract
 
-```text
-Prompt
-  |
-  v
-Lightweight Slot Parser
-  |---- target class
-  |---- optional attribute
-  |---- optional relation
-  `---- optional reference class
-  |
-  v
-Frozen/small text encoder -> cached prompt embeddings
+For image `I` and free-form description `q`, predict a set
 
-Camera frame
-  |
-  v
-YOLOE-26M open-vocabulary detector
-  |
-  |---- candidate boxes
-  |---- detector confidences
-  `---- target/reference candidate labels
-  |
-  +-------------------------------+
-                                  |
-Frame ----------------> Frozen lightweight region encoder
-                                  |
-                         ROI-aligned region features
-                                  |
-                                  v
-                    Attribute-Relation Grounding Head
-                       |       |         |
-                       |       |         `--> no-target logit
-                       |       `------------> relation score
-                       `--------------------> target score
-                                  |
-                                  v
-                         selected target box
-```
+`Y = {(b_i, p_i)}; |Y| in {0,1,...,N}`
 
-### Why YOLOE-26M
+where `b_i = [x1,y1,x2,y2]` and `p_i` is the calibrated match probability.
 
-YOLOE already solves the open-vocabulary candidate-generation problem. Starting from a closed-set detector would require simultaneously inventing open-vocabulary classification, region-text alignment, compositional grounding, and rejection.
+The query may contain:
 
-The medium variant is the first student hypothesis because the large model is already close to the real-time budget on the current development machine, while the small model may sacrifice too much proposal recall. Final ablation must compare at least YOLOE-S and YOLOE-M.
+- object class / noun phrase;
+- attributes such as color, size, material or state;
+- spatial relation, e.g. left/right/above/below/near;
+- one or more contextual/anchor objects;
+- expressions that match multiple objects;
+- expressions for which no valid object exists.
 
-### Region features
+The final model must therefore distinguish three separate questions:
 
-V1 uses a frozen ImageNet MobileNetV3-Small feature map + ROIAlign. This deliberately avoids undocumented YOLOE internal hooks and makes candidate caching deterministic. A later optimization can reuse a YOLOE internal feature map after the research pipeline is stable.
+- **Localization**: are all potentially relevant objects present among proposals?
+- **Grounding**: which proposal(s) satisfy the query?
+- **Existence/rejection**: is there no valid target at all?
 
-### Prompt representation
-
-```text
-target_class
-attribute?          # max 1
-relation?           # max 1
-reference_class?    # required when relation exists
-```
-
-The parser runs only when the prompt changes, so its latency is excluded from steady-state frame latency and reported separately.
+These questions are trained/evaluated separately internally, but are exposed as one final model API.
 
 ---
 
-## 3. Grounding head
+# 2. Final architecture
 
-For each candidate object `i`:
-
-### 3.1 Class gate
-
-YOLOE is prompted with the target and optional reference classes. V1 hard-gates target candidates by YOLOE's returned label.
-
-### 3.2 Attribute score
+## 2.1 Overall dataflow
 
 ```text
-A_i = similarity(attribute_projection(region_i), attribute_text_embedding)
+QUERY q
+  |
+  +--> lightweight parser ------------------> QueryGraph
+  |                                           target phrase
+  |                                           anchor phrase(s)
+  |                                           relation id
+  |                                           parser-valid mask
+  |
+  +--> frozen text encoder -----------------> token features T [B,L,Dt]
+                                              pooled full-query tq [B,Dt]
+                                              target entity et [B,Dt]
+                                              anchor entity ea [B,Dt]
+
+IMAGE I
+  |
+  +--> prompt-independent YOLOE proposal ----> boxes Bx [B,K,4]
+  |                                            detector score s [B,K]
+  |                                            optional detector label
+  |
+  +--> frozen visual backbone + RoIAlign ----> visual ROI V [B,K,Dv]
+                                               |
+                                               + detector-label text prior Elabel [B,K,Dt]
+                                               + box geometry Gbox [B,K,Dg]
+                                               + detector score
+                                               |
+                                               v
+                                          Object Token X [B,K,D]
+                                               |
+                      +------------------------+------------------------+
+                      |                                                 |
+                      v                                                 v
+               A0 generic branch                                A1 structured branch
+               object self-attention                            entity-object matching
+               text cross-attention                             pairwise relation score
+                      |                                                 |
+                generic logits g_i                              structured logits r_i
+                      +-------------------------+-----------------------+
+                                                |
+                                          learned gate alpha
+                                                |
+                                      candidate logit z_i
+                                                |
+                           +--------------------+--------------------+
+                           |                                         |
+                           v                                         v
+                    sigmoid candidates                         explicit null head
+                           |                                         |
+                           +--------------------+--------------------+
+                                                |
+                                      calibrated 0 / 1 / N boxes
 ```
 
-If the prompt has no attribute, this term is masked out.
+## 2.2 Proposal generator
 
-### 3.3 Relation score
+Default checkpoint: `yoloe-26s-seg-pf.pt`.
 
-For target candidate `i` and reference candidate `j`:
+Requirements:
 
-```text
-R_ij = MLP([
-    region_i,
-    region_j,
-    geometry(box_i, box_j),
-    relation_text_embedding,
-])
-```
+- prompt-independent at inference;
+- low confidence threshold, default 0.02;
+- `max_det=96`, retain top `K=64` after score sort;
+- input resolution 640;
+- proposal output is `[box_xyxy, detector_score, optional detector_label]`;
+- proposal class label is only an optional semantic prior, never a hard target/reference mask.
 
-Geometry includes center offsets, normalized distance, size/area ratios, IoU, overlap/containment hints, and normalized target center.
+Reason: relational grounding requires both target and contextual objects to exist in the candidate set. A head-noun-only detector can make reasoning impossible before the fusion module sees the image.
 
-The candidate relation score is the maximum compatible reference score.
+## 2.3 Detector-independent visual object token
 
-### 3.4 Final decision
+Do not use an undocumented hidden YOLOE tensor as the main object representation. Use a separate frozen visual path:
 
-Each candidate receives a fused score from detector confidence, class gate, attribute score, relation score, and region features. A learned `NO_TARGET` logit is appended:
+1. Resize RGB image to `512 x 512` while tracking original geometry.
+2. Frozen `MobileNetV3-Small` ImageNet backbone.
+3. RoIAlign each candidate box on the final feature map.
+4. Pool a `3 x 3` crop to one 576-dimensional vector.
 
-```text
-candidate_0 ... candidate_N-1, NO_TARGET
-```
+For candidate `i`, build:
 
-This is mandatory for robot safety because the model must be able to refuse a prompt.
+`x_i = LN(Wv * ROI_i + Wb * geom(box_i) + Ws * score_i + Wl * label_embedding_i)`
 
----
+Recommended normalized single-box geometry:
 
-## 4. Teacher-student strategy
+- center x/y;
+- width/height;
+- area;
+- log aspect ratio.
 
-### Student
+`label_embedding_i` is optional. It is useful as a prior but must be ablated later to prove the fusion model does not merely reuse detector labels.
 
-Deployment student:
+Tensor contract after padding:
 
-```text
-YOLOE-26M
-+ frozen lightweight region encoder
-+ cached text embeddings
-+ attribute/relation grounding head
-+ no-target head
-```
+- `visual`: `[B,K,576]`
+- `boxes`: `[B,K,4]`, normalized to [0,1]
+- `scores`: `[B,K]`
+- `label_emb`: `[B,K,Dt]`
+- `candidate_mask`: `[B,K]` boolean
+- object token `X`: `[B,K,D]`, default D=256.
 
-### Teacher
+## 2.4 Text representation
 
-Primary teacher: **Grounding DINO**.
+Default encoder: `distilbert-base-uncased`, frozen initially.
 
-Teacher is used offline to produce:
+For the full query:
 
-- boxes;
-- region-language relevance;
-- candidate distributions;
-- pseudo labels for additional robot frames.
+- tokenize to max length 48;
+- obtain token states `T_raw [B,L,Dt]`;
+- project to model width: `T = Wt(T_raw) [B,L,D]`;
+- mean-pool valid tokens for full-query vector `q_pool [B,Dt]`.
 
-The teacher is never required by deployment inference.
+For structured A1, encode the parser-produced target phrase and anchor phrase separately to `e_target` and `e_anchor`.
 
-### Distillation
+Text computation is cacheable per command at real-time inference.
 
-Teacher outputs are aligned to student candidates and cached as a distribution over:
+## 2.5 Query parser / QueryGraph
 
-```text
-student candidates + NO_TARGET
-```
+The parser is a helper, not the sole semantic path. A0 always receives the complete original sentence.
 
-Student minimizes supervised losses plus temperature-scaled KL divergence. Teacher computation therefore adds training cost but **zero deployment latency**.
+Minimum QueryGraph fields:
 
-LocateAnything or another heavy VLM may be used only as an optional oracle for analysis or pseudo-label verification.
-
----
-
-## 5. Canonical data schema
-
-All source datasets are normalized into JSONL before training.
-
-Positive example:
-
-```json
+```python
 {
-  "id": "sample_000001",
-  "image": "images/000001.jpg",
-  "width": 1280,
-  "height": 720,
-  "prompt": "the red cup next to the pillow",
-  "slots": {
-    "target_class": "cup",
-    "attribute": "red",
-    "relation": "next_to",
-    "reference_class": "pillow"
-  },
-  "target_boxes": [[124, 210, 280, 390]],
-  "reference_boxes": [[310, 190, 590, 420]],
-  "no_target": false,
-  "source": "robot_train"
+  "raw": str,
+  "target_phrase": str,
+  "anchor_phrase": str | None,
+  "relation": one_of[
+      "none", "left_of", "right_of", "above", "below",
+      "near", "in_front_of", "behind", "inside", "on_top_of"
+  ],
+  "has_relation": bool,
+  "parser_confidence": float | None,
 }
 ```
 
-Negative example uses the same schema but has `target_boxes: []` and `no_target: true`.
+Research-v1 parser may be deterministic for common relations. Later versions can replace it with an LLM parser executed once per command. Parser failure must set `has_relation=False`, preserving A0 behavior.
 
-Recommended dataset progression:
+## 2.6 A0 — generic full-sentence fusion
 
-1. RefCOCO / RefCOCO+ / RefCOCOg — target grounding;
-2. Visual Genome — attributes and pairwise relations;
-3. gRefCOCO/GREC — no-target/generalized referring expressions;
-4. OmniLabel — language-based/open-vocabulary detection evaluation;
-5. robot-domain RGB/RGB-D data — final adaptation.
+Purpose: strong parser-independent baseline and residual semantic path.
+
+Pipeline:
+
+1. `X0 = object_token_builder(...)`
+2. object self-attention: `X1 = TransformerEncoder(X0, mask)`
+3. repeat `Ncross` blocks:
+   - candidate-to-text multi-head cross-attention;
+   - residual + LayerNorm;
+   - FFN + residual + LayerNorm.
+4. generic logit: `g_i = MLP_generic(X_final_i)`.
+
+Default:
+
+- D=256;
+- heads=8;
+- object layers=2;
+- cross layers=2;
+- FFN=512;
+- dropout=0.1.
+
+Why self-attention before text cross-attention: an object should see other objects before deciding whether relational language applies. This creates an implicit scene context even when the parser is imperfect.
+
+## 2.7 A1 — structured entity/relation reasoning
+
+A1 exists to make relational reasoning explicit and diagnosable.
+
+### Entity-object matching
+
+Project object token and entity text into a normalized shared space:
+
+`u_i = normalize(Wo X_i)`
+
+`v_t = normalize(We e_target)`
+
+`v_a = normalize(We e_anchor)`
+
+Scores:
+
+`S_target(i) = scale * dot(u_i, v_t)`
+
+`S_anchor(j) = scale * dot(u_j, v_a)`.
+
+A1 never receives hard `target_mask/reference_mask` from YOLOE.
+
+### Anchor pruning
+
+Computing every pair is O(K^2). On A3000, rank candidates using `S_anchor` and retain top `M=8` anchors. Then relation computation is O(K*M).
+
+### Pairwise geometry
+
+For target candidate i and anchor j, compute a relative geometry vector including:
+
+- normalized center dx/dy;
+- Euclidean center distance;
+- log width ratio;
+- log height ratio;
+- left/right signed margins;
+- above/below signed margins;
+- pair IoU.
+
+`G_ij` is passed through an MLP to a geometry embedding.
+
+### Relation compatibility
+
+Embed relation id `r` into `e_r`.
+
+For each target-anchor pair:
+
+`R_ij = MLP_rel([X_i, X_j, e_r, MLP_geom(G_ij)]) + S_anchor(j)`.
+
+Aggregate over top anchors using `logsumexp`, not hard argmax:
+
+`rel_i = logsumexp_j(R_ij) - log(M)`.
+
+Structured score:
+
+- no relation: `r_i = S_target(i)`;
+- relation present: `r_i = S_target(i) + rel_i`.
+
+This branch directly answers: “candidate i looks like the requested target, and there exists a plausible anchor j satisfying relation r.”
+
+## 2.8 A0/A1 fusion
+
+Learn a sample-level gate from pooled full-query representation and `has_relation`:
+
+`alpha = sigmoid(MLP_gate([q_pool, has_relation]))`.
+
+Final candidate logit:
+
+`z_i = g_i + alpha * r_i`.
+
+This is deliberately residual. A1 adds structured evidence; it does not erase the generic full-sentence path.
+
+## 2.9 Explicit no-target head
+
+A sigmoid per candidate is not sufficient to reject absent targets. Build a separate null head from:
+
+- pooled contextual object representation;
+- pooled query representation;
+- best candidate logit;
+- optionally proposal-count/statistical features.
+
+`z_null = MLP_null([...])`.
+
+Training label:
+
+- `y_null=1` if GT target set is empty;
+- `y_null=0` otherwise.
+
+At inference, reject when calibrated null probability exceeds `tau_null`, or when no candidate exceeds `tau_candidate`.
+
+## 2.10 Multi-target behavior
+
+Do **not** softmax candidates against each other. Use independent BCE/focal logits. A query can therefore activate more than one candidate. Apply NMS only after semantic thresholding.
 
 ---
 
-## 6. Candidate cache
+# 3. Dataset pipeline
 
-Stage 1 keeps YOLOE fixed. For each sample, cache:
+## 3.1 Main training set
+
+Use official gRefCOCO annotations from `FudanCVL/gRefCOCO` plus MS COCO train2014 images.
+
+Normalize each sentence into one row:
 
 ```text
 sample_id
-boxes                 [N,4] normalized xyxy
-candidate_labels      list[str]
-detector_scores       [N]
-region_features       [N,D]
-candidate_mask        [N]
-target_mask           [N]
-reference_mask        [N]
-target_index          int, -1 for no-target
-attribute_embedding   [T]
-relation_embedding    [T]
-relation_reference_target_mask [N] optional
-teacher_distribution  [N+1] optional
+image_id
+file_name
+split
+query
+gt_boxes_xyxy[]
+no_target
+category_names[]
 ```
 
-Positive examples where YOLOE fails to propose the annotated target are recorded as **proposal failures**, not silently converted into no-target examples.
+One image may have multiple sentences; proposal/ROI cache is keyed by image, not sentence.
+
+## 3.2 Splits
+
+Respect dataset-provided split names. Do not leak validation/test sentences or images into training transformations that learn parameters.
+
+Training: `train`.
+Validation: `val` for early stopping and calibration.
+Held-out reporting: test/testA/testB when available.
+
+## 3.3 Cache schema
+
+One file per unique image:
+
+```python
+{
+  "image_id": int,
+  "file_name": str,
+  "width": int,
+  "height": int,
+  "boxes_xyxy": FloatTensor[K,4],
+  "scores": FloatTensor[K],
+  "labels": list[str],
+  "roi_features": Float16Tensor[K,576],
+  "gt_bank_boxes": FloatTensor[G,4],
+  "gt_bank_features": Float16Tensor[G,576],
+}
+```
+
+Cache metadata must record proposal checkpoint, input size, confidence threshold, K, ROI backbone, ROI input size, and code/config version. If any of these changes, invalidate the cache.
+
+## 3.4 Training-only GT injection
+
+Proposal recall limits the student. For a training sample, if a GT box has no proposal with IoU >= 0.5, inject that GT box plus its cached ROI feature into the candidate list.
+
+Rules:
+
+- training only;
+- GT-injected object has detector score 0;
+- no detector label semantic prior;
+- never inject at validation/test/inference;
+- record injection rate as a diagnostic.
+
+This provides a learning signal for the grounding model while exposing proposal misses rather than silently discarding those examples. High injection rate means proposal generation is the bottleneck and must be improved before claiming final system quality.
+
+## 3.5 Candidate labels
+
+Match GT boxes to candidates by IoU. Greedy one-candidate-per-GT assignment is preferred to avoid many duplicate positives for one object. Unmatched valid candidates are negatives.
+
+No-target samples contain all-zero candidate labels and `null=1`.
 
 ---
 
-## 7. Hard-negative strategy
+# 4. Training strategy for 12 GB VRAM
 
-Hard negatives are mandatory.
+## 4.1 Precompute phase
 
-Given `red cup next to pillow`, generate candidate negatives by changing exactly one slot:
+On each unique image:
 
-- wrong class: `red bottle next to pillow`;
-- wrong attribute: `blue cup next to pillow`;
-- wrong relation: `red cup under pillow`;
-- wrong reference: `red cup next to laptop`.
+1. load image;
+2. YOLOE prompt-free inference under inference_mode + FP16;
+3. keep low-threshold top proposals;
+4. frozen MobileNetV3 forward;
+5. RoIAlign proposal features;
+6. RoIAlign all unique GT boxes used by train expressions;
+7. save cache to CPU/disk.
 
-Generated candidates must be verified against annotations before becoming training negatives. Do not assume a string mutation is automatically false in the image.
+Then delete YOLOE and MobileNet objects and call CUDA cache cleanup.
 
-Maintain a balance of positive samples, easy negatives, one-slot hard negatives, and scenes containing multiple same-class objects.
+This is essential: training should not hold detector + visual backbone + text encoder + fusion gradients simultaneously.
 
----
+## 4.2 Text phase
 
-## 8. Training stages
+Keep DistilBERT frozen. It runs under `torch.inference_mode()`. For further optimization, sentence/entity embeddings may be cached after the first working run.
 
-### Stage 0 — baseline/environment
+## 4.3 DOD-core training
 
-1. freeze package versions;
-2. run CPU synthetic smoke tests;
-3. run YOLOE-26M inference on a small validation set;
-4. measure target/reference proposal recall;
-5. benchmark raw detector latency/p95;
-6. save environment metadata.
+Train only A0/A1/null/fusion parameters initially.
 
-**Exit gate:** detector works on target GPU and proposal recall/latency baselines exist.
+Recommended A3000 defaults:
 
-### Stage 1 — supervised grounding with frozen YOLOE
+- batch size 16;
+- AMP FP16;
+- AdamW;
+- lr `3e-4`;
+- weight decay `1e-4`;
+- grad clip 1.0;
+- 10 epochs max;
+- early stopping patience 3;
+- DataLoader workers 0 on Windows/Jupyter for reliability; increase only after validation.
 
-Frozen:
+Loss:
 
-- YOLOE detector;
-- MobileNetV3 region encoder;
-- pretrained text encoder.
+`L = lambda_c * L_candidate + lambda_n * L_null + lambda_e * L_entity + lambda_r * L_rank`
 
-Trainable:
+Initial weights:
 
-- visual/text projections;
-- attribute head;
-- relation head;
-- target fusion head;
-- no-target head.
+- candidate 1.0;
+- null 0.45;
+- entity 0.20;
+- optional ranking 0.10.
 
-Workflow:
+Candidate/entity loss: focal BCE to handle severe positive/negative imbalance.
 
-1. cache train/val YOLOE candidates;
-2. cache region/text embeddings;
-3. train grounding head;
-4. save every epoch;
-5. maintain `last.pt` and `best.pt`;
-6. evaluate positive/no-target/attribute/relation subsets independently.
+Null loss: BCEWithLogits.
 
-**Exit gate:** beats `highest detector confidence` target selection on ambiguous scenes and provides useful no-target behavior.
+Structured auxiliary supervision should use candidate-GT matching, not detector labels.
 
-### Stage 2 — Grounding DINO distillation
+## 4.4 Training checks that do not stop the pipeline
 
-1. run teacher offline;
-2. align teacher boxes with student candidates;
-3. cache teacher distributions;
-4. resume from Stage 1 best checkpoint;
-5. train with supervised + KD loss;
-6. verify accuracy gain without deployment latency change.
+Log every epoch:
 
-### Stage 3 — robot-domain adaptation
+- train/val total loss;
+- candidate positive recall at selected threshold;
+- candidate precision;
+- no-target accuracy;
+- no-target FPR/FPPC if available;
+- GT-injection fraction;
+- mean proposals/image;
+- GPU max allocated/reserved memory;
+- data time and step time.
 
-1. collect RGB/RGB-D frames across clutter, lighting, camera pose, occlusion;
-2. manually annotate a high-quality subset;
-3. pseudo-label additional frames with Grounding DINO;
-4. human-verify high-value/hard examples;
-5. generate robot hard negatives;
-6. fine-tune the grounding head using mixed general + robot data;
-7. keep general validation active to detect over-specialization.
-
-### Stage 4 — optional YOLOE adaptation
-
-Only after Stages 1–3 are stable. Fine-tune YOLOE only if proposal recall is the measured bottleneck. Any detector-weight change invalidates old candidate caches; regenerate caches and re-train/fine-tune the grounding head.
-
-### Stage 5 — deployment optimization
-
-1. cache prompt embeddings until prompt changes;
-2. fixed input size where practical;
-3. FP16 first, INT8 only after calibration/accuracy checks;
-4. ONNX/TensorRT for supported components;
-5. separate capture/inference/render threads;
-6. latest-frame policy to avoid stale queues;
-7. optional detector-every-N-frames + tracker between detections;
-8. report raw inference FPS separately from tracked display FPS.
+Keep best checkpoint by validation objective, not the final epoch.
 
 ---
 
-## 9. Losses
+# 5. Calibration and final decision rule
+
+After loading the best checkpoint, collect validation logits.
+
+Search candidate threshold `tau_c` and null threshold `tau_n` on a fixed grid. Objective should balance target F1 and no-target accuracy; record the exact objective.
+
+Optional next step: temperature scaling for candidate and null logits. Calibration parameters belong in the final model bundle.
+
+Inference:
+
+1. calculate null probability;
+2. if `p_null >= tau_n`: output empty set;
+3. otherwise sigmoid each candidate logit;
+4. retain `p_i >= tau_c`;
+5. semantic NMS, default IoU 0.5;
+6. return up to `max_outputs` boxes.
+
+---
+
+# 6. Benchmark contract
+
+The final notebook must at minimum report:
+
+## Proposal diagnostics
+
+- Recall@K at IoU 0.50 and 0.75;
+- train GT-injection rate;
+- proposal count distribution.
+
+For a relation-annotated diagnostic subset, additionally report target recall, anchor recall, and joint target+anchor recall. Do not fabricate anchor ground truth from a parser.
+
+## DOD/grounding
+
+- precision / recall / F1 at IoU 0.50;
+- precision / recall / F1 at IoU 0.75;
+- no-target accuracy;
+- no-target false positives / FPPC when evaluator supports it;
+- multi-target recall;
+- per-query-length and relation/non-relation slices.
+
+When official D3/OmniLabel/OVDEval evaluators are added, report their native metrics unchanged. Do not compare Recall@K to mAP numerically; use an oracle prediction generated from the same proposal set and run it through the same official evaluator when estimating headroom.
+
+## Calibration
+
+- selected `tau_candidate`;
+- selected `tau_null`;
+- optional ECE/Brier score;
+- validation objective used to select thresholds.
+
+## Runtime
+
+Measure after accuracy is functional:
+
+- proposal P50/P95;
+- ROI object-token extraction P50/P95;
+- text encoding latency when command changes;
+- DOD core P50/P95;
+- end-to-end P50/P95;
+- FPS for repeated frames with cached text;
+- peak VRAM.
+
+The deployment target remains >=10 FPS on the eventual edge target, but training-machine numbers are reference only.
+
+---
+
+# 7. Final artifact format
+
+A successful full notebook run creates:
 
 ```text
-L_total =
-    L_target
-  + lambda_attr * L_attribute
-  + lambda_rel  * L_relation
-  + lambda_none * L_no_target
-  + lambda_kd   * L_distillation
+rt_lcod/artifacts/dod_final_model/
+  final_dod_bundle.pt
+  region_encoder.pt
+  proposal_model.pt              # if local checkpoint was resolved/copied
+  text_encoder/
+    config.json
+    model.safetensors
+    tokenizer files...
+  calibration.json
+  metrics.json
+  training_history.csv
+  dataset_metadata.json
+  config.json
 ```
 
-- `L_target`: cross-entropy over N candidates + NO_TARGET;
-- `L_attribute`: candidate-level attribute supervision;
-- `L_relation`: verified target-reference pair supervision when available;
-- `L_no_target`: explicit rejection auxiliary loss;
-- `L_distillation`: temperature-scaled KL teacher/student distribution loss.
+`final_dod_bundle.pt` contains at least:
 
----
+- architecture version;
+- learned DOD core state dict;
+- dimensions / relation vocabulary;
+- full training configuration;
+- candidate/null calibration;
+- proposal model identifier;
+- text encoder identifier;
+- dataset/cache metadata hash where practical.
 
-## 10. Prompt parser roadmap
+The reference runtime must be able to start from only the artifact directory plus Python dependencies and execute:
 
-### V1
-
-Deterministic relation lexicon + one-hop controlled grammar. This makes grounding experiments reproducible and lets parser errors be separated from grounding errors.
-
-### V2
-
-Train a small token classifier with labels:
-
-```text
-O
-B/I-TARGET
-B/I-ATTRIBUTE
-B/I-RELATION
-B/I-REFERENCE
-```
-
-Evaluate parser slot F1 and exact structured-prompt accuracy independently from LCOD grounding.
-
----
-
-## 11. Experiment tracking and checkpointing
-
-Every run creates:
-
-```text
-runs/<timestamp>_<run_name>/
-  config.yaml
-  environment.json
-  run_state.json
-  metrics.jsonl
-  metrics.csv
-  timing.json
-  checkpoints/
-    last.pt
-    best.pt
-    epoch_XXXX.pt
-```
-
-Track:
-
-- seed;
-- git commit;
-- Python/PyTorch/CUDA/GPU;
-- optimizer/scheduler parameters;
-- global step/epoch;
-- elapsed and epoch time;
-- data/forward/backward timing;
-- validation metrics;
-- best metric;
-- peak VRAM where available.
-
-`last.pt` stores model, optimizer, scheduler, AMP scaler, epoch/global step, best metric, and RNG states so training can resume without resetting the learning schedule.
-
----
-
-## 12. Evaluation protocol
-
-### Proposal evaluation
-
-Before blaming grounding, measure target and reference proposal recall@K. A missing target candidate cannot be recovered by the grounding head.
-
-### Prompt buckets
-
-Report separately:
-
-- class only;
-- class + attribute;
-- class + relation;
-- class + attribute + relation;
-- no-target.
-
-### Difficulty buckets
-
-Create splits for:
-
-- one target-class candidate;
-- multiple same-class candidates;
-- attribute-confusable objects;
-- relation-confusable objects;
-- crowded scenes;
-- target absent;
-- reference absent.
-
-### Latency modes
-
-1. **raw**: detector + region encoder + grounding every frame;
-2. **practical robot**: latest-frame policy + optional tracker.
-
-Prompt parsing/encoding latency is measured separately.
-
----
-
-## 13. Temporal tracking for robot deployment
-
-Tracking is an optional system optimization, not part of the static LCOD metric.
-
-V1 includes a minimal single-target IoU tracker:
-
-- initialize from grounded target;
-- update on overlapping detections;
-- keep track ID while IoU/score gates pass;
-- re-ground when confidence drops, object disappears, prompt changes, or track expires.
-
-ByteTrack/BoT-SORT can replace it later.
-
----
-
-## 14. Robot API/state machine
-
-Perception API target:
-
-```text
-set_prompt(text)
-process_frame(rgb, optional_depth)
--> target_box | NO_TARGET
--> confidence
--> parsed_prompt
--> timing
--> optional track_id
-```
-
-Robot state machine:
-
-```text
-WAIT_PROMPT
-  -> PARSE_PROMPT
-  -> ACQUIRE_TARGET
-  -> TRACK_TARGET
-  -> HAND_OFF_TO_GRASP
-  -> VERIFY / REACQUIRE
-```
-
-Keep 2D LCOD, 3D projection, grasp planning, and manipulation control separable so perception failures are not confused with grasp/control failures.
-
----
-
-## 15. Minimum ablation
-
-| ID | Detector | Attribute | Relation | No-target | KD | Robot FT |
-|---|---|---|---|---|---|---|
-| A0 | YOLOE | no | no | no | no | no |
-| A1 | YOLOE | yes | no | yes | no | no |
-| A2 | YOLOE | yes | yes | yes | no | no |
-| A3 | YOLOE | yes | yes | yes | GDINO | no |
-| A4 | YOLOE | yes | yes | yes | GDINO | yes |
-
-Also compare YOLOE-S vs YOLOE-M for final speed/accuracy Pareto selection.
-
----
-
-## 16. Repository layout
-
-```text
-plan.md
-rt_lcod/
-  README.md
-  VALIDATION.md
-  pyproject.toml
-  requirements.txt
-  .env.example
-  configs/{base.yaml,smoke.yaml}
-  src/rt_lcod/
-    config.py
-    prompt.py
-    geometry.py
-    data/{schema.py,cached_dataset.py,synthetic.py}
-    models/{region_encoder.py,text_encoder.py,grounding_head.py,student.py,teacher.py,yoloe_adapter.py}
-    training/{losses.py,metrics.py,checkpoint.py,tracker.py,trainer.py}
-    inference/{runtime.py,temporal.py}
-    utils/{seed.py,logging.py,timing.py}
-  scripts/
-    validate_manifest.py
-    cache_candidates.py
-    cache_teacher.py
-    generate_hard_negatives.py
-    train.py
-    evaluate.py
-    benchmark_runtime.py
-    smoke_test.py
-  notebooks/rt_lcod_end_to_end.ipynb
-  tests/
-.github/workflows/rt_lcod_ci.yml
+```python
+runtime = FinalDODRuntime(artifact_dir)
+result = runtime.predict(image, "the cup to the left of the red box")
+# result -> list[{box:[x1,y1,x2,y2], score:float}]
 ```
 
 ---
 
-## 17. Beginner execution order
+# 8. Notebook execution contract
 
-### Step 1 — smoke path
+New notebook path:
 
-```bash
-cd rt_lcod
-python -m venv .venv
-# activate environment
-python -m pip install -U pip
-python -m pip install -e .[dev]
-python scripts/smoke_test.py
-pytest -q
-```
+`rt_lcod/notebooks/rt_lcod_dod_final_end_to_end.ipynb`
 
-Do not proceed until this passes.
+Normal usage:
 
-### Step 2 — notebook smoke mode
+1. use a CUDA-enabled PyTorch environment;
+2. open notebook from `rt_lcod/notebooks`;
+3. edit only the single configuration cell if paths/hyperparameters must change;
+4. leave `quick=False` for final training;
+5. Run All;
+6. wait for data download/cache/training/evaluation to finish;
+7. inspect `../artifacts/dod_final_model/final_dod_bundle.pt` and metrics;
+8. execute the final inference cell on a held-out/local image.
 
-Open `notebooks/rt_lcod_end_to_end.ipynb`, keep `RUN_HEAVY=False`, and Run All.
+`quick=True` is permitted only to verify mechanics on a small subset. A quick-run checkpoint must never be presented as the final research result.
 
-### Step 3 — prepare/validate manifests
-
-```bash
-python scripts/validate_manifest.py --manifest data/manifests/train.jsonl
-```
-
-### Step 4 — cache YOLOE candidates
-
-```bash
-python scripts/cache_candidates.py \
-  --config configs/base.yaml \
-  --manifest data/manifests/train.jsonl \
-  --output data/candidate_cache/train \
-  --model yoloe-26m.pt
-```
-
-Repeat for validation.
-
-### Step 5 — Stage 1 training
-
-```bash
-python scripts/train.py \
-  --config configs/base.yaml \
-  --train-cache data/candidate_cache/train \
-  --val-cache data/candidate_cache/val \
-  --run-name stage1
-```
-
-### Step 6 — cache teacher outputs
-
-```bash
-python scripts/cache_teacher.py \
-  --manifest data/manifests/train.jsonl \
-  --candidate-cache data/candidate_cache/train \
-  --output data/teacher_cache/train
-```
-
-### Step 7 — Stage 2 KD
-
-```bash
-python scripts/train.py \
-  --config configs/base.yaml \
-  --train-cache data/candidate_cache/train \
-  --val-cache data/candidate_cache/val \
-  --teacher-cache data/teacher_cache/train \
-  --resume runs/<stage1>/checkpoints/best.pt \
-  --run-name stage2_kd
-```
-
-### Step 8 — evaluate
-
-```bash
-python scripts/evaluate.py \
-  --config configs/base.yaml \
-  --cache data/candidate_cache/val \
-  --checkpoint runs/<run>/checkpoints/best.pt
-```
-
-### Step 9 — benchmark actual runtime
-
-```bash
-python scripts/benchmark_runtime.py \
-  --config configs/base.yaml \
-  --checkpoint runs/<run>/checkpoints/best.pt \
-  --video ../test.mp4 \
-  --prompt "red cup next to pillow"
-```
-
-### Step 10 — robot adaptation
-
-Only after general validation works: collect robot data, annotate, add verified hard negatives/pseudo labels, fine-tune with mixed general + robot data, and rerun both general and robot benchmarks.
+The pipeline is idempotent where possible: downloaded annotations/images and per-image caches are reused when present.
 
 ---
 
-## 18. Stage gates
+# 9. Failure handling built into the end-to-end run
 
-- **Proposal gate:** YOLOE must propose target/reference at sufficient recall.
-- **Grounding gate:** learned selector must beat highest detector-confidence baseline on ambiguous scenes.
-- **Negative gate:** no-target accuracy/FPR must be measured before robot use.
-- **KD gate:** teacher distillation must improve validation without adding deployment cost.
-- **Realtime gate:** use p95 latency on the actual target GPU, not only average FPS.
-- **Robot gate:** prove perception target acquisition/rejection before interpreting manipulation success.
+The notebook should fail early with an actionable error for:
 
----
+- CPU-only torch when user requested a full run;
+- missing/corrupt gRefCOCO annotations;
+- missing COCO images after download;
+- YOLOE prompt-free checkpoint incompatibility;
+- NaN/Inf training loss;
+- malformed cache tensor shapes;
+- artifact reload failure.
 
-## 19. Main risks and fallback order
+It should not silently continue when data is incomplete.
 
-### YOLOE misses objects
+Operational OOM fallback order for A3000 12 GB:
 
-Compare S/M/L, improve prompt synonyms, then consider mixed-data YOLOE adaptation only after proposal recall proves this is the bottleneck.
-
-### Region encoder costs too much
-
-Reduce top-K/channels/resolution, then replace the auxiliary encoder with a YOLOE internal feature map once the integration is stable.
-
-### Parser dominates errors
-
-Evaluate with oracle structured slots, then train a small slot tagger. Keep controlled-grammar robot mode until parser exact-match is adequate.
-
-### Teacher hallucination
-
-Never overwrite verified labels. Confidence-filter pseudo labels and manually inspect teacher/student disagreements.
-
-### Robot fine-tuning destroys open-vocabulary ability
-
-Keep YOLOE frozen as long as possible; mix general data into robot training and monitor held-out novel classes.
+1. reduce training batch 16 -> 8 -> 4;
+2. leave K=64 if possible because K affects proposal ceiling;
+3. reduce d_model 256 -> 192 only if needed;
+4. cache text features so DistilBERT is not resident during training;
+5. never solve OOM by increasing proposal confidence first, because that can destroy recall.
 
 ---
 
-## 20. What can and cannot be guaranteed
+# 10. Post-v1 extensions (not required for first final model)
 
-The branch is engineered so the **core project code, synthetic training, checkpoint/resume, loss/metrics, prompt parsing, geometry, experiment timing, and tracker are testable without heavy model downloads**.
+Only after the English gRefCOCO final model is reproducible:
 
-No code scaffold can honestly guarantee a future research accuracy/FPS before training on real datasets and benchmarking the actual robot GPU. The project therefore uses explicit measurable stage gates instead of promising an unsupported result.
+- replace rule parser with one-shot LLM structured parser;
+- multilingual comparison: Vietnamese -> English translation vs multilingual encoder;
+- add teacher-generated hard negatives and paraphrases;
+- add relation-annotated Visual Genome diagnostic training/subsets;
+- official D3, OmniLabel, OVDEval evaluation;
+- distill/quantize text and fusion modules;
+- TensorRT proposal path and ONNX/TensorRT DOD-core export;
+- integrate tracking for video/robot perception;
+- replace MobileNet ROI backbone with a feature pyramid only if accuracy justifies latency.
 
-The final objective is:
+The final research question remains:
 
-> maximize open-vocabulary proposal coverage, one-hop class/attribute/relation grounding, no-target reliability, and real-time throughput on the robot's actual hardware.
+> Can a prompt-independent object proposal set plus a lightweight object-token language-relation model achieve useful 0/1/N described-object detection while preserving a deployable latency budget?
