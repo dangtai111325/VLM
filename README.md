@@ -1,73 +1,57 @@
-# RT-LCOD — Real-Time Language-Conditioned Object Detection
+# DOD-VLM End-to-End
 
-This branch implements one concrete V1 architecture:
+Project độc lập để huấn luyện **Described Object Detection VLM** trên RTX A3000 12 GB.
 
-**YOLOE-26M open-vocabulary detector + lightweight attribute/relation grounding head + explicit NO_TARGET + Grounding DINO teacher distillation.**
+## Mục tiêu
 
-Grounding DINO is training-only. Deployment keeps YOLOE plus the small student head.
+Input:
+- 1 ảnh RGB
+- 1 mô tả tự do bằng tiếng Anh
 
-## V1 prompt contract
+Output:
+- 0, 1 hoặc N bounding boxes thỏa mô tả.
 
-A prompt contains one target class, optionally one simple attribute, and optionally one first-order relation plus one reference class.
+## Kiến trúc
 
-Examples:
+1. **YOLOE-26s prompt-free** tạo proposal độc lập với câu.
+2. **Frozen MobileNetV3-FPN + MultiScaleRoIAlign** tạo object visual tokens.
+3. **DistilBERT** mã hóa toàn câu và entity phrase; 2 transformer layer cuối được fine-tune.
+4. **A0 generic fusion:** object self-attention + text cross-attention.
+5. **A1 structured fusion:** target/anchor matching + relation-conditioned pairwise geometry.
+6. **Learned fusion gate** trộn A0 và A1.
+7. **Candidate sigmoid heads** hỗ trợ 0/1/N.
+8. **Explicit null head** học no-target.
+9. **Validation calibration** chọn threshold trước khi test.
 
-- `cup`
-- `red cup`
-- `fire extinguisher`
-- `red car next to bus`
-- `bottle left of laptop`
+## Chạy
 
-Second-order relation chains are intentionally out of scope for V1.
+Mở:
 
-## Local RTX Run All notebook
+`notebooks/dod_vlm_end_to_end.ipynb`
 
-Open:
+và chọn **Run All**.
 
-`rt_lcod/notebooks/rt_lcod_end_to_end.ipynb`
+Notebook tự:
+- cài dependency còn thiếu;
+- tải gRefCOCO annotation;
+- tải đúng ảnh COCO cần dùng;
+- cache YOLOE proposal + object ROI feature;
+- resume cache/checkpoint nếu bị gián đoạn;
+- train VLM;
+- calibrate;
+- evaluate;
+- lưu final bundle;
+- reload bundle và chạy inference sanity check.
 
-On the local RTX A3000, **Run All executes the real pipeline** rather than the old synthetic-only notebook:
+## Artifact cuối
 
-```text
-gRefCOCO subset
-  -> train / val / held-out test manifests
-  -> YOLOE-26M proposal cache
-  -> frozen region/text feature cache
-  -> Stage 1 supervised grounding training
-  -> Stage 1 validation
-  -> Grounding DINO offline teacher cache
-  -> Stage 2 knowledge distillation
-  -> choose Stage 1 vs Stage 2 on validation
-  -> held-out final test
-  -> load final checkpoint
-  -> interactive video player + prompt textbox
-```
+`dod_vlm_workspace/runs/dod_vlm_grefcoco_v1/final_model/dod_vlm_final.pt`
 
-Default local baseline sizes are deliberately bounded: 1,000 train, 150 validation, 150 test, and at most 300 teacher samples. Change them only after collecting the first full set of logs.
+## Yêu cầu máy
 
-## Logs kept for optimization
+- Python >= 3.10
+- NVIDIA RTX A3000 12 GB
+- PyTorch có CUDA
+- đủ disk cho ảnh COCO được dùng + feature cache
 
-The notebook and scripts print/store environment, GPU/VRAM, data statistics, proposal recall, losses, target/no-target accuracy, checkpoints, elapsed times, cache statistics and video latency. Video inference reports detector/region/head latency plus mean/p50/p95/p99 and processing FPS.
-
-Generated datasets, caches, checkpoints and model files stay local and are gitignored.
-
-## Repository layout
-
-- `plan.md` — broader research plan
-- `rt_lcod/configs/local_a3000.yaml` — RTX A3000 baseline profile
-- `rt_lcod/scripts/prepare_grefcoco.py` — real dataset preparation
-- `rt_lcod/src/rt_lcod/runall.py` — one-click orchestrator
-- `rt_lcod/src/rt_lcod/inference/video_ui.py` — video/prompt UI
-- `rt_lcod/notebooks/rt_lcod_end_to_end.ipynb` — main entry point
-- `.github/workflows/rt_lcod_ci.yml` — CPU smoke/unit CI
-
-## Local development smoke test
-
-```bash
-cd rt_lcod
-python -m pip install -e .[all]
-python scripts/smoke_test.py
-pytest -q
-```
-
-CPU CI validates software contracts. YOLOE/Grounding-DINO training speed and final accuracy must be measured on the local RTX A3000 run; the notebook is instrumented specifically to capture those values.
+Toàn bộ logic nghiên cứu nằm trong notebook; project không phụ thuộc code legacy.
