@@ -22,10 +22,11 @@ class GroundingDINOTeacher:
         self.processor = AutoProcessor.from_pretrained(model_name)
         kwargs = {}
         if dtype is not None:
-            kwargs["torch_dtype"] = dtype
+            kwargs["dtype"] = dtype
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_name, **kwargs)
         self.model = self.model.to(device).eval()
         self.device = device
+        self.dtype = next(self.model.parameters()).dtype
 
     @torch.inference_mode()
     def predict(self, image: Image.Image, prompt: str, threshold: float = 0.25):
@@ -33,7 +34,16 @@ class GroundingDINOTeacher:
         if not text.endswith("."):
             text += "."
         inputs = self.processor(images=image, text=text, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # The processor creates pixel_values as FP32.  On CUDA the teacher is
+        # deliberately loaded in FP16 to fit comfortably on the local RTX A3000,
+        # so only floating tensors must be converted to the model dtype.  Token
+        # IDs and masks must retain their integer/bool dtypes.
+        inputs = {
+            key: value.to(self.device, dtype=self.dtype)
+            if value.is_floating_point()
+            else value.to(self.device)
+            for key, value in inputs.items()
+        }
         outputs = self.model(**inputs)
         raw = self.processor.post_process_grounded_object_detection(
             outputs,

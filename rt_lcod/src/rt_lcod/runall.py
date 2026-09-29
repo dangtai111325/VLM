@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import platform
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -101,9 +103,40 @@ class RunAll:
             label = Path(str(args[1])).stem
         print("[CMD]", " ".join(map(str, args)), flush=True)
         started = time.perf_counter()
-        process = subprocess.Popen([str(x) for x in args], cwd=self.root)
+        environment = os.environ.copy()
+        environment["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            [str(x) for x in args],
+            cwd=self.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=environment,
+        )
+        output: queue.Queue[str] = queue.Queue()
+
+        def copy_child_output() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                output.put(line)
+            process.stdout.close()
+
+        reader = threading.Thread(target=copy_child_output, daemon=True)
+        reader.start()
+
+        def print_available_output() -> None:
+            while True:
+                try:
+                    print(output.get_nowait(), end="", flush=True)
+                except queue.Empty:
+                    return
+
         next_heartbeat = 30.0
         while process.poll() is None:
+            print_available_output()
             elapsed = time.perf_counter() - started
             if elapsed >= next_heartbeat:
                 print(
@@ -113,9 +146,16 @@ class RunAll:
                 )
                 next_heartbeat += 30.0
             time.sleep(1.0)
+        reader.join(timeout=5.0)
+        print_available_output()
         if process.returncode:
+            print(
+                f"[CMD][ERROR] {label} failed with rc={process.returncode}. "
+                "The complete child traceback is printed above.",
+                flush=True,
+            )
             raise subprocess.CalledProcessError(process.returncode, [str(x) for x in args])
-        print(f"[CMD] {label}: rc=0 elapsed_s={time.perf_counter() - started:.2f}")
+        print(f"[CMD] {label}: rc=0 elapsed_s={time.perf_counter() - started:.2f}", flush=True)
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:

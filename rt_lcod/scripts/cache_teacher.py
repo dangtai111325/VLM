@@ -60,15 +60,37 @@ def main() -> None:
 
     stats = {"total": len(samples), "cached_new": 0, "cached_existing": 0, "missing_candidate": 0}
     teacher_detection_sum = 0
+    progress_every = max(1, len(samples) // 20)
+    last_reported = 0
+
+    def report_progress(processed: int) -> None:
+        nonlocal last_reported
+        if processed - last_reported < progress_every and processed != len(samples):
+            return
+        elapsed = time.perf_counter() - started
+        rate = processed / max(elapsed, 1e-6)
+        eta_s = (len(samples) - processed) / max(rate, 1e-6)
+        print(
+            f"[PROGRESS] teacher={processed}/{len(samples)} "
+            f"completed={100 * processed / max(len(samples), 1):.0f}% "
+            f"new={stats['cached_new']} existing={stats['cached_existing']} "
+            f"missing_candidate={stats['missing_candidate']} "
+            f"rate={rate:.2f}_sample/s eta_m={eta_s / 60:.1f}",
+            flush=True,
+        )
+        last_reported = processed
+
     progress = tqdm(samples, desc="cache teacher", unit="sample", dynamic_ncols=True)
-    for sample in progress:
+    for index, sample in enumerate(progress, start=1):
         out_path = output / f"{safe_name(sample.sample_id)}.pt"
         if out_path.exists() and not args.no_resume:
             stats["cached_existing"] += 1
+            report_progress(index)
             continue
         candidate_path = candidate_root / f"{safe_name(sample.sample_id)}.pt"
         if not candidate_path.exists():
             stats["missing_candidate"] += 1
+            report_progress(index)
             continue
         cached = torch.load(candidate_path, map_location="cpu", weights_only=False)
         boxes_norm = cached["boxes"].float()
@@ -91,6 +113,7 @@ def main() -> None:
         torch.save({"sample_id": sample.sample_id, "teacher_distribution": distribution}, out_path)
         stats["cached_new"] += 1
         progress.set_postfix(new=stats["cached_new"], missing=stats["missing_candidate"])
+        report_progress(index)
 
     report = {
         **stats,
