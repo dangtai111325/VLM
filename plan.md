@@ -1,233 +1,334 @@
-# DOD-VLM — Kế hoạch triển khai cuối cùng
+# DOD-VLM — Final End-to-End Plan
 
-## 1. Bài toán
+## 1. Task contract
 
-Huấn luyện một mô hình Vision-Language cho **Described Object Detection (DOD)**:
+Cho ảnh `I` và free-form description `q`, model dự đoán tập:
 
-- input: ảnh `I` + mô tả tự do `q`;
-- output: tập `Y = {(b_i, s_i)}` với số phần tử có thể là 0, 1 hoặc N;
-- câu có thể chứa class, thuộc tính, quan hệ và mô tả dài;
-- mục tiêu nghiên cứu v1: English;
-- mục tiêu triển khai về sau: >=10 FPS trên edge GPU sau khi tối ưu runtime.
+`Y = {(b_i, s_i)}`
 
-## 2. Quyết định kiến trúc
+với `|Y|` có thể bằng 0, 1 hoặc N.
 
-### 2.1 Proposal độc lập prompt
+Model phải xử lý được:
 
-Dùng `YOLOE-26s-seg-pf.pt`.
+- noun/class;
+- attribute như màu sắc/kích thước;
+- first-order spatial relation;
+- multi-target;
+- absent/no-target.
+
+Research v1 dùng English. Mục tiêu edge `>=10 FPS` là deployment target sau khi quality được xác nhận; notebook hiện tại đo latency thật nhưng không giả định đã đạt target.
+
+---
+
+## 2. Kiến trúc khóa
+
+### 2.1 Prompt-independent proposal
+
+Default: `yoloe-26s-seg-pf.pt`.
 
 Lý do:
-- lệnh robot có thể đổi liên tục;
-- proposal không bị khóa theo prompt export;
-- candidate space độc lập với query;
-- fusion chịu trách nhiệm semantic matching.
 
-### 2.2 Object token độc lập detector head
+- query robot đổi liên tục;
+- không phụ thuộc dynamic text prompt trong detector export;
+- proposal space không đổi theo câu;
+- language-conditioned reasoning nằm ở student VLM.
 
-Không phụ thuộc embedding nội bộ YOLOE.
+Output mỗi ảnh:
+
+- `boxes[K,4]`;
+- detector confidence;
+- detector label chỉ dùng diagnostic/runtime output metadata;
+- `fallback_mask[K]`.
+
+Nếu YOLOE trả 0 box, thêm một full-image **context fallback token**. Token này chỉ giữ attention numerically stable, không tham gia candidate loss và không được xuất prediction.
+
+### 2.2 Detector-independent object visual token
+
+Không dùng undocumented YOLOE detection embedding.
 
 Pipeline:
-`image -> frozen MobileNetV3-FPN -> MultiScaleRoIAlign(YOLOE boxes) -> 256-D object vectors`.
 
-Điều này tách:
-- localization;
-- representation;
-- language-conditioned reasoning.
+`image -> FasterRCNN GeneralizedRCNNTransform -> frozen MobileNetV3-FPN -> MultiScaleRoIAlign(YOLOE boxes) -> avg pool -> 256-D vector`
+
+Quan trọng: dùng đúng normalization/resize transform của pretrained Faster-RCNN, đồng thời rescale proposal box sang transformed coordinates trước RoIAlign.
 
 ### 2.3 Text stream
 
-Dùng `distilbert-base-uncased`.
+Default: `distilbert-base-uncased`.
 
-- toàn bộ model pretrained;
-- freeze phần lớn;
-- fine-tune 2 transformer layer cuối;
-- giữ token-level features để cross-attention;
-- encode thêm target phrase / anchor phrase cho structured path.
+- pretrained English bidirectional encoder;
+- freeze phần lớn model;
+- fine-tune 2 layer cuối;
+- full token features phục vụ A0;
+- target/anchor phrase embeddings phục vụ A1.
 
-### 2.4 A0 — Generic fusion
+### 2.4 Query parsing
 
-Input:
-- `V[B,K,256]`;
-- normalized box geometry;
-- `T[B,L,d]`.
+Parser chỉ là auxiliary structured path.
 
-Pipeline:
-1. visual projection;
-2. geometry projection;
-3. object self-attention;
-4. text cross-attention;
-5. generic candidate logits.
+Input parser:
 
-A0 luôn tồn tại và không phụ thuộc parser.
+- raw query duy nhất;
+- không dùng GT category làm model input.
 
-### 2.5 A1 — Structured relational grounding
+Output:
 
-Query được parse nhẹ thành:
 - target phrase;
 - optional anchor phrase;
-- optional relation.
+- optional relation ID.
+
+**Cùng một hàm parser được dùng trong train và inference** để loại train/inference mismatch.
+
+A0 luôn nhận full sentence nên parser không phải single point of failure.
+
+### 2.5 A0 — Generic grounding
+
+Inputs:
+
+- visual token `V[B,K,256]`;
+- box geometry;
+- full text token `T[B,L,d]`.
+
+Flow:
+
+1. project visual token sang `d_model`;
+2. cộng learned box geometry encoding;
+3. self-attention giữa object tokens;
+4. cross-attention object → full sentence tokens;
+5. generic candidate logit.
+
+### 2.6 A1 — Structured relational grounding
 
 A1 học:
-- `S_target(i)`;
-- `S_anchor(j)`;
-- pairwise geometry `G(i,j)`;
+
+- scaled target-object cosine logit `S_target(i)`;
+- scaled anchor-object cosine logit `S_anchor(j)`;
+- pair geometry `G(i,j)` gồm relative center, width/height ratio, left/right/above/below margin, IoU, distance, overlap;
 - relation-conditioned compatibility `R(i,j,r)`;
-- latent anchor aggregation;
-- structured target logits.
+- latent anchor aggregation bằng log-sum-exp trên anchor distribution;
+- structured candidate logit.
 
-Không yêu cầu anchor ground-truth box cho mọi sample; anchor là latent variable.
+Không yêu cầu anchor GT box cho toàn bộ gRefCOCO.
 
-### 2.6 Learned fusion
+### 2.7 Learned A0/A1 fusion
 
-`candidate_logit = (1-g(q))*A0 + g(q)*A1`
+`p_logit(i) = (1-g(q))*A0(i) + g(q)*A1(i)`
 
-Nếu parser không tốt, gate có thể nghiêng về A0.
+`g(q)` học từ pooled query representation.
 
-### 2.7 No-target
+### 2.8 No-target
 
-Không dùng threshold candidate làm cơ chế reject duy nhất.
+Có explicit global `null_logit` từ:
 
-Có explicit:
-`null_logit = f(global object context, query context, best candidate score, detector statistics)`.
+- pooled object context;
+- pooled query context;
+- best valid candidate logit;
+- detector score statistics;
+- flag có real output candidate hay không.
 
-Training có no-target examples từ gRefCOCO.
+No-target không được giải bằng candidate threshold duy nhất.
 
-### 2.8 Multi-target
+---
 
-Mỗi candidate dùng sigmoid độc lập, không softmax theo candidate.
+## 3. Dataset
 
-## 3. Dữ liệu
+### Main train/validation/test
 
-### Train/val/test chính
+- gRefCOCO annotations;
+- COCO train2014 images.
 
-gRefCOCO + COCO train2014 images.
+Query-level schema:
 
-gRefCOCO được dùng vì có:
-- single target;
-- multiple target;
-- no-target.
-
-### Schema nội bộ
-
-Mỗi query:
-- image_id;
-- query;
-- gt boxes;
-- target categories;
+- sample ID;
+- split;
+- image ID/path;
+- raw query;
+- GT boxes;
+- target categories **diagnostic only**;
 - no-target flag.
 
-## 4. Proposal / feature cache
+Notebook tải chỉ các ảnh thực sự xuất hiện trong manifest.
 
-Tính một lần trên mỗi unique image.
+---
 
-Cache:
-- candidate boxes;
-- YOLOE confidence;
-- YOLOE class label;
-- 256-D ROI feature;
-- train GT ROI feature phục vụ optional GT injection.
+## 4. Feature cache và resume
 
-Cache có signature theo:
-- proposal model;
+Expensive vision computation chạy một lần trên mỗi unique image.
+
+Mỗi cache file chứa:
+
+- boxes;
+- detector scores;
+- labels;
+- fallback mask;
+- 256-D ROI object tokens;
+- train GT boxes + GT ROI features phục vụ optional GT injection;
 - image size;
-- confidence;
-- K;
-- ROI output config.
+- cache signature.
+
+Cache signature phụ thuộc proposal config + ROI config + encoder recipe.
+
+Atomic save tránh file nửa chừng.
+
+---
 
 ## 5. GT injection
 
-Chỉ train.
+Chỉ áp dụng train.
 
-Nếu sample positive không có proposal IoU >= 0.5:
-- có xác suất chèn GT ROI đã cache;
-- injected candidate detector score = 0;
-- validation/test/inference không dùng injection.
+Nếu positive query không có real proposal IoU >= 0.5:
 
-Mục tiêu:
-- không bỏ toàn bộ supervision khi proposal miss;
-- vẫn theo dõi train/test mismatch.
+- deterministic probability theo `sample_id`;
+- chèn GT ROI đã cache;
+- injected detector score = 0;
+- validation/test/runtime tuyệt đối không inject.
 
-## 6. Loss
+Mục đích: không mất toàn bộ fusion supervision khi proposal miss, nhưng vẫn giữ test-time proposal ceiling thực tế.
 
-`L = L_candidate + 0.5 L_null + 0.2 L_target_entity`
+---
 
-Trong đó:
-- candidate: focal BCE masked theo valid candidate;
-- null: BCE;
-- target entity auxiliary: tăng alignment của positive candidate với target phrase.
+## 6. Training trên RTX A3000 12 GB
 
-## 7. Training trên A3000 12 GB
+### Preflight
 
-- proposal + ROI cache chạy trước;
-- giải phóng YOLOE + visual backbone;
-- training chỉ giữ cached object vectors + text encoder + DOD core;
-- AMP fp16;
-- batch 12;
-- grad accumulation 2;
+Trước optimizer training:
+
+- chạy real cached batch;
+- full forward + backward;
+- nếu CUDA OOM, giảm batch `8 -> 6 -> 4 -> 2`;
+- tăng gradient accumulation để effective batch xấp xỉ 24.
+
+### Optimizer
+
 - AdamW;
-- fusion LR 3e-4;
-- text LR 2e-5;
-- gradient clipping;
+- fusion LR `3e-4`;
+- text LR `2e-5`;
+- AMP fp16;
+- grad clip 1.0;
 - cosine scheduler;
 - early stopping.
 
-## 8. Checkpoint / resume
+### Loss
 
-Ba lớp recovery:
+`L = 1.0*L_candidate + 0.5*L_null + 0.2*L_target_entity`
 
-1. Feature cache per image: image đã xong không tính lại.
-2. `recovery.pt`: lưu định kỳ giữa epoch.
-3. `last.pt` / `best.pt`: epoch-level checkpoint.
+- `L_candidate`: focal BCE trên valid real/injected candidates;
+- `L_null`: BCE no-target;
+- `L_target_entity`: BCE alignment trên scaled target-object similarity.
 
-DataLoader train seed theo epoch để resume giữa epoch gần đúng thứ tự batch.
+### Checkpoint
 
-## 9. Calibration
+- `recovery.pt`: giữa epoch, chỉ ghi sau optimizer step;
+- `last.pt`: sau mỗi epoch;
+- `best.pt`: best validation F1;
+- lưu model/optimizer/scheduler/scaler/RNG/config/training signature.
 
-Sau training:
-- load best checkpoint;
-- chạy validation một lần và cache logits;
-- grid search candidate threshold và null threshold trên CPU;
-- khóa threshold;
-- evaluate test đúng một lần.
+Train DataLoader seed theo epoch và GT injection deterministic để resume reproducible hơn.
 
-## 10. Metric bắt buộc
+---
 
-- set precision @ IoU 0.5;
-- set recall @ IoU 0.5;
-- set F1 @ IoU 0.5;
-- no-target accuracy;
+## 7. Calibration
+
+Validation model inference chỉ chạy **một lần**.
+
+Sau đó CPU:
+
+1. fit candidate temperature;
+2. fit null temperature;
+3. grid search candidate threshold × null threshold bằng fast set metrics;
+4. khóa calibration;
+5. evaluate held-out split.
+
+Không recompute AP trong từng grid cell.
+
+---
+
+## 8. Metrics
+
+Final evaluation báo:
+
+- set Precision@IoU0.5;
+- set Recall@IoU0.5;
+- set F1@IoU0.5;
+- AP50;
+- AP75;
+- mAP@0.5:0.95;
+- negative reject accuracy;
 - false boxes per negative;
-- train/val loss;
+- null Brier score;
+- null ECE;
+- training loss/history;
 - peak VRAM;
-- elapsed time mỗi session / epoch.
+- elapsed session/epoch time;
+- end-to-end runtime latency P50/P95 và FPS từ P50.
 
-Benchmark nghiên cứu mở rộng về sau:
-- D3;
-- OmniLabel;
-- OVDEval;
-- RefCOCO/+/g legacy comparison;
-- latency P50/P95 trên Jetson.
+Proposal diagnostics báo:
 
-## 11. Final artifact
+- target Recall@0.5;
+- target Recall@0.75;
+- query-all-targets recall;
+- mean recoverability 0.5:0.95.
 
-`dod_vlm_final.pt` chứa:
-- DODVLM state dict;
+Anchor/joint recall không được giả lập trên gRefCOCO vì benchmark không cung cấp structured anchor GT cho mọi expression; cần relation diagnostic subset riêng.
+
+---
+
+## 9. Final artifact
+
+`final_model/` chứa:
+
+- `dod_vlm_core.pt` — trained DOD-VLM state + text config;
+- `tokenizer/` — local tokenizer;
+- `proposal_model.pt` — local YOLOE checkpoint;
+- `region_encoder.pt` — frozen backbone state + transform recipe;
 - config;
-- proposal checkpoint name;
-- visual encoder recipe;
 - calibration;
 - metrics;
-- architecture metadata.
+- README.
 
-Notebook phải reload artifact từ disk và infer một sample thật trước khi kết thúc.
+Ngoài ra tạo `dod_vlm_final_bundle.zip`.
 
-## 12. Điều kiện notebook được coi là hoàn thành
+Runtime load hoàn toàn từ local model assets, không gọi Hugging Face/Ultralytics để tải weights.
 
-- Run All không phụ thuộc source legacy;
+Notebook bắt buộc:
+
+1. export;
+2. `del model`, GC, clear CUDA cache;
+3. tạo `DODVLMRuntime` mới từ disk;
+4. infer ảnh thật;
+5. benchmark latency.
+
+---
+
+## 10. Tiêu chí hoàn thành notebook
+
+Notebook được coi là hoàn thành về engineering khi:
+
+- project không phụ thuộc legacy code;
 - mọi code cell compile;
-- core A0/A1 pass synthetic forward/backward;
+- dependency/CUDA preflight rõ ràng;
+- real batch forward/backward preflight pass;
+- zero-proposal path finite;
 - feature cache resumable;
-- train resumable giữa epoch;
-- best checkpoint + calibration + final bundle được tạo;
-- final bundle reload được;
-- runtime inference trả `[]` hoặc list boxes.
+- mid-epoch + epoch checkpoint resumable;
+- train/infer parser giống nhau;
+- best checkpoint được calibrate;
+- held-out metrics được ghi;
+- final artifact self-contained về model assets;
+- artifact reload + inference pass;
+- latency benchmark được lưu.
+
+Không tuyên bố “100% chạy trên mọi máy” trước khi full Run All thực tế hoàn tất trên đúng environment/hardware; notebook được thiết kế để fail-fast và resume thay vì che giấu lỗi môi trường.
+
+---
+
+## 11. Phase sau final research-v1
+
+- D³;
+- OmniLabel;
+- OVDEval;
+- Visual Genome / manually verified relation diagnostic subset;
+- teacher-generated hard negatives/paraphrases;
+- multilingual Vietnamese;
+- YOLO/ROI TensorRT or integrated object-token engine;
+- Jetson Orin P50/P95 latency và quality/latency Pareto.
